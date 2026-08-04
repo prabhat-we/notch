@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/apple/Documents/Design/ticktoday/notch 2>&1; echo \"---\"; ls -la /Users/apple/Documents/Design/ticktoday/ 2>&1)",
+      "Bash(command -v cloudflared)",
+      "Bash(command -v ngrok)",
+      "Bash(command -v lt)",
+      "Bash(lsof -i :5173 -sTCP:LISTEN)",
+      "Bash(npx --yes localtunnel --port 5173 --print-requests)",
+      "Bash(curl -s -m 5 -o /dev/null -w \"%{http_code}\\\\n\" https://loca.lt/)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(pkill -f \"localtunnel\")",
+      "Bash(curl -s -m 5 -o /dev/null -w \"%{http_code}\\\\n\" https://www.google.com)",
+      "Bash(curl -s -m 8 -o /dev/null -w \"loca.lt: %{http_code}\\\\n\" https://loca.lt/)",
+      "Bash(curl -s -m 8 -o /dev/null -w \"cloudflare trycloudflare: %{http_code}\\\\n\" https://trycloudflare.com/)",
+      "Bash(command -v brew)"
+    ]
+  }
+}
