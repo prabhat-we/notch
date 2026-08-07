@@ -1,5 +1,5 @@
 -- ============================================
--- Tickboxer — Supabase schema (updated)
+-- whynotch — Supabase schema (updated)
 -- Safe to run on a fresh project OR re-run on top
 -- of the original schema — every statement is
 -- idempotent (IF NOT EXISTS / DROP+CREATE POLICY).
@@ -12,6 +12,11 @@
 --                          which stays owner/employee for
 --                          permissions.
 --   • memberships.color  — hex avatar color per person.
+--   • memberships.full_name — the person's display name,
+--                          set once by them via the
+--                          "complete your profile" step on
+--                          first login. Null until then —
+--                          the UI falls back to email.
 --   • tasks.image_urls    — photos attached to a task.
 --   • comments.image_urls — photos attached to a comment.
 --   • DELETE policies for tasks and memberships, and an
@@ -38,6 +43,7 @@ create table if not exists memberships (
   user_id uuid references auth.users(id) on delete set null, -- null until they accept invite
   email text not null,
   role text not null check (role in ('owner','employee')),   -- app permission level
+  full_name text,                                             -- set via "complete your profile" on first login
   title text not null default '',                             -- job title, e.g. "Floor Manager"
   color text not null default '#7C3AED',                      -- avatar color (hex)
   manager_id uuid references memberships(id),                 -- for org hierarchy (L1/L2)
@@ -46,6 +52,7 @@ create table if not exists memberships (
 );
 alter table memberships add column if not exists title text not null default '';
 alter table memberships add column if not exists color text not null default '#7C3AED';
+alter table memberships add column if not exists full_name text;
 create index if not exists idx_memberships_org on memberships(org_id);
 create index if not exists idx_memberships_user on memberships(user_id);
 

@@ -1,10 +1,16 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import {
   LayoutDashboard, ListTodo, Settings, Plus, Mic, Play, Pause,
   Clock, Users, Check, X, Volume2, StopCircle,
-  UserPlus, Trash2, Bell, TrendingUp, ChevronRight, ChevronLeft,
-  Shield, Pencil, Image as ImageIcon
+  Trash2, Bell, TrendingUp, ChevronRight, ChevronLeft,
+  Shield, Pencil, Image as ImageIcon, LogOut, Send, Loader2
 } from "lucide-react";
+import { useAuth } from "./auth/AuthContext";
+import AuthScreen from "./auth/AuthScreen";
+import NoOrgAccess from "./auth/NoOrgAccess";
+import CompleteProfileScreen from "./auth/CompleteProfileScreen";
+import { supabase } from "../lib/supabase";
+
 
 /* ─── Types ───────────────────────────────────────────────── */
 type TaskStatus = "todo" | "in-progress" | "done";
@@ -19,6 +25,8 @@ interface Employee {
   role: string;
   color: string;
   email: string;
+  /** True when this membership row has no linked user_id yet — invited but not signed up. */
+  pending?: boolean;
 }
 interface Comment {
   id: string;
@@ -56,23 +64,7 @@ const S_CFG: Record<TaskStatus, { label: string; text: string; bg: string }> = {
 };
 const AVATAR_COLORS = ["#7C3AED","#0891B2","#059669","#DC2626","#D97706","#4F46E5","#DB2777"];
 
-const INIT_EMPLOYEES: Employee[] = [
-  { id:"e1", name:"Maria Santos", role:"Floor Manager",    color:"#7C3AED", email:"maria@store.com" },
-  { id:"e2", name:"Jake Park",    role:"Inventory Lead",   color:"#0891B2", email:"jake@store.com"  },
-  { id:"e3", name:"Priya Nair",   role:"Customer Service", color:"#059669", email:"priya@store.com" },
-];
-const INIT_TASKS: Task[] = [
-  { id:"t1", title:"Restock produce section",    description:"Check all bins and reorder from Sunrise Farms — focus on tomatoes and greens.",        assigneeId:"e2", createdById:null, status:"todo",        priority:"high",   dueDate:"2026-07-23", voiceNoteUrl:null, imageUrls:[], createdAt:"2026-07-22", order:0, comments:[
-    { id:"c1", authorId:"e1", text:"Sunrise Farms said they can rush the tomato order if we call before 10am.", createdAt:"2026-07-22" },
-  ] },
-  { id:"t2", title:"Train new register staff",   description:"Walk through POS system and end-of-day cash procedures with the two new hires.",        assigneeId:"e1", createdById:null, status:"in-progress", priority:"high",   dueDate:"2026-07-22", voiceNoteUrl:null, imageUrls:[], createdAt:"2026-07-21", order:0, comments:[] },
-  { id:"t3", title:"Call vendor about delivery", description:"Confirm Thursday delivery window with Pacific Supply Co. Ask about the delays.",         assigneeId:"e3", createdById:null, status:"todo",        priority:"medium", dueDate:"2026-07-24", voiceNoteUrl:null, imageUrls:[], createdAt:"2026-07-22", order:1, comments:[] },
-  { id:"t4", title:"Update pricing signage",     description:"Replace weekly sale signs throughout the store floor before 9am opening.",              assigneeId:"e1", createdById:null, status:"done",        priority:"low",    dueDate:"2026-07-21", voiceNoteUrl:null, imageUrls:[], createdAt:"2026-07-20", order:1, comments:[] },
-  { id:"t5", title:"Deep clean storage room",    description:"Full sanitization required before health inspection on Friday — use the blue kit.",     assigneeId:null, createdById:null, status:"todo",        priority:"medium", dueDate:"2026-07-25", voiceNoteUrl:null, imageUrls:[], createdAt:"2026-07-22", order:2, comments:[] },
-];
-
 /* ─── Helpers ─────────────────────────────────────────────── */
-const mkId = () => Math.random().toString(36).slice(2, 9);
 const initials = (n: string) => n.split(" ").map(p => p[0]).join("").toUpperCase().slice(0, 2);
 const TODAY = new Date("2026-07-22");
 function relDate(d: string) {
@@ -84,6 +76,89 @@ function relDate(d: string) {
 }
 const isOverdue = (d: string, s: TaskStatus) => new Date(d) < TODAY && s !== "done";
 const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+// Deterministic avatar color from a membership id — there's no color-picker UI
+// anymore (invites are just an email), so every real team member still gets a
+// distinct, stable color instead of everyone sharing the DB default.
+function colorForId(id: string) {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) | 0;
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+}
+
+// Maps a `memberships` row to the `Employee` shape the existing task-assignee
+// UI already speaks — full_name if set, otherwise email, per the "complete
+// your profile" flow.
+interface MembershipRow {
+  id: string;
+  email: string;
+  full_name: string | null;
+  role: AppRole;
+  user_id?: string | null;
+}
+function toEmployee(m: MembershipRow): Employee {
+  return {
+    id: m.id,
+    name: m.full_name?.trim() || m.email,
+    role: m.role === "owner" ? "Owner" : "Team Member",
+    color: colorForId(m.id),
+    email: m.email,
+    pending: m.user_id == null,
+  };
+}
+
+// Maps `tasks`/`comments` rows to the Task/Comment shapes the existing UI
+// already speaks. Comments are fetched alongside their task's org and
+// merged in client-side (see fetchTasks in AuthenticatedApp) rather than
+// lazily per-open-task, since task list cards show comment counts too.
+interface TaskRow {
+  id: string;
+  title: string;
+  description: string;
+  assignee_id: string | null;
+  created_by: string | null;
+  status: TaskStatus;
+  priority: Priority;
+  due_date: string | null;
+  voice_note_url: string | null;
+  image_urls: string[];
+  sort_order: number;
+  created_at: string;
+}
+interface CommentRow {
+  id: string;
+  task_id: string;
+  author_id: string | null;
+  text: string;
+  image_urls: string[];
+  created_at: string;
+}
+function toComment(c: CommentRow): Comment {
+  return {
+    id: c.id,
+    authorId: c.author_id ?? "",
+    text: c.text,
+    createdAt: c.created_at,
+    imageUrls: c.image_urls,
+  };
+}
+function toTask(t: TaskRow, comments: Comment[]): Task {
+  return {
+    id: t.id,
+    title: t.title,
+    description: t.description,
+    assigneeId: t.assignee_id,
+    createdById: t.created_by,
+    status: t.status,
+    priority: t.priority,
+    dueDate: t.due_date ?? "",
+    voiceNoteUrl: t.voice_note_url,
+    imageUrls: t.image_urls ?? [],
+    createdAt: t.created_at,
+    comments,
+    order: t.sort_order,
+  };
+}
 
 /* ─── BottomSheet wrapper ─────────────────────────────────── */
 function BottomSheet({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
@@ -276,7 +351,7 @@ function VoiceNotePlayer({ url }: { url: string }) {
 function TaskFormFields({
   title, setTitle, desc, setDesc, priority, setPriority,
   dueDate, setDueDate, assigneeId, setAssigneeId, status, setStatus,
-  voiceNoteUrl, setVoice, imageUrls, setImageUrls, employees, showStatus, isOwner, onAddMember,
+  voiceNoteUrl, setVoice, imageUrls, setImageUrls, employees, showStatus,
 }: {
   title: string; setTitle: (v: string) => void;
   desc: string; setDesc: (v: string) => void;
@@ -287,7 +362,6 @@ function TaskFormFields({
   voiceNoteUrl: string | null; setVoice: (v: string | null) => void;
   imageUrls: string[]; setImageUrls: (v: string[]) => void;
   employees: Employee[]; showStatus: boolean;
-  isOwner?: boolean; onAddMember?: () => void;
 }) {
   const titleOptional = !showStatus && !title.trim() && (!!voiceNoteUrl || imageUrls.length > 0);
 
@@ -369,13 +443,6 @@ function TaskFormFields({
               {emp.name.split(" ")[0]}
             </button>
           ))}
-          {isOwner && onAddMember && (
-            <button type="button" onClick={onAddMember}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-indigo-50 text-indigo-600 border border-dashed border-indigo-200 hover:bg-indigo-100 transition-all"
-            >
-              <UserPlus size={12} /> Add
-            </button>
-          )}
         </div>
       </div>
 
@@ -393,12 +460,10 @@ function TaskFormFields({
 }
 
 /* ─── AddTaskModal ────────────────────────────────────────── */
-function AddTaskModal({ employees, defaultAssigneeId, assignLabel, isOwner, onAddMember, onAdd, onClose }: {
+function AddTaskModal({ employees, defaultAssigneeId, assignLabel, onAdd, onClose }: {
   employees: Employee[];
   defaultAssigneeId?: string | null;
   assignLabel?: string;
-  isOwner?: boolean;
-  onAddMember?: () => void;
   onAdd: (t: Omit<Task, "id" | "createdAt" | "comments" | "order">) => void;
   onClose: () => void;
 }) {
@@ -444,7 +509,6 @@ function AddTaskModal({ employees, defaultAssigneeId, assignLabel, isOwner, onAd
           voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
           imageUrls={imageUrls} setImageUrls={setImageUrls}
           employees={employees} showStatus={false}
-          isOwner={isOwner} onAddMember={onAddMember}
         />
         <button type="button" onClick={submit} disabled={!hasContent}
           className="w-full mt-5 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 disabled:cursor-not-allowed hover:bg-indigo-700 active:bg-indigo-800 transition-colors shadow-lg shadow-indigo-600/20"
@@ -457,10 +521,9 @@ function AddTaskModal({ employees, defaultAssigneeId, assignLabel, isOwner, onAd
 }
 
 /* ─── EditTaskModal ───────────────────────────────────────── */
-function EditTaskModal({ task, employees, onAddMember, onSave, onDelete, onClose }: {
+function EditTaskModal({ task, employees, onSave, onDelete, onClose }: {
   task: Task;
   employees: Employee[];
-  onAddMember?: () => void;
   onSave: (updated: Task) => void;
   onDelete: (id: string) => void;
   onClose: () => void;
@@ -539,155 +602,9 @@ function EditTaskModal({ task, employees, onAddMember, onSave, onDelete, onClose
             voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
             imageUrls={imageUrls} setImageUrls={setImageUrls}
             employees={employees} showStatus={true}
-            isOwner onAddMember={onAddMember}
           />
           <button type="button" onClick={save} disabled={!title.trim()}
             className="w-full mt-5 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"
-          >
-            Save Changes
-          </button>
-        </div>
-      )}
-    </BottomSheet>
-  );
-}
-
-/* ─── EmployeeFormFields ──────────────────────────────────── */
-function EmployeeFormFields({
-  name, setName, role, setRole, email, setEmail, cidx, setCidx,
-}: {
-  name: string; setName: (v: string) => void;
-  role: string; setRole: (v: string) => void;
-  email: string; setEmail: (v: string) => void;
-  cidx: number; setCidx: (v: number) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-col items-center gap-3">
-        <div className="w-16 h-16 rounded-full flex items-center justify-center text-white text-xl font-black shadow-lg" style={{ backgroundColor: AVATAR_COLORS[cidx] }}>
-          {name ? initials(name) : "?"}
-        </div>
-        <div className="flex gap-2">
-          {AVATAR_COLORS.map((c, i) => (
-            <button key={c} onClick={() => setCidx(i)}
-              className={`w-6 h-6 rounded-full transition-all ${cidx === i ? "scale-125 ring-2 ring-slate-400 ring-offset-1" : ""}`}
-              style={{ backgroundColor: c }}
-            />
-          ))}
-        </div>
-      </div>
-      <input value={name} onChange={e => setName(e.target.value)} placeholder="Full name"
-        className="w-full bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/25 focus:bg-white transition-all"
-      />
-      <input value={role} onChange={e => setRole(e.target.value)} placeholder="Role (e.g. Cashier, Cook, Driver)"
-        className="w-full bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/25 focus:bg-white transition-all"
-      />
-      <input value={email} onChange={e => setEmail(e.target.value)} placeholder="Email for task notifications" type="email"
-        className="w-full bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/25 focus:bg-white transition-all"
-      />
-    </div>
-  );
-}
-
-/* ─── AddEmployeeModal ────────────────────────────────────── */
-function AddEmployeeModal({ onAdd, onClose }: {
-  onAdd: (emp: Omit<Employee, "id">) => void;
-  onClose: () => void;
-}) {
-  const [name, setName]   = useState("");
-  const [role, setRole]   = useState("");
-  const [email, setEmail] = useState("");
-  const [cidx, setCidx]   = useState(0);
-
-  const submit = () => {
-    if (!name.trim() || !role.trim()) return;
-    onAdd({ name, role, email, color: AVATAR_COLORS[cidx] });
-    onClose();
-  };
-
-  return (
-    <BottomSheet onClose={onClose}>
-      <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100">
-        <h2 className="text-base font-bold text-slate-800">Add Team Member</h2>
-        <button onClick={onClose} className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center">
-          <X size={15} className="text-slate-500" />
-        </button>
-      </div>
-      <div className="p-5 space-y-4">
-        <EmployeeFormFields name={name} setName={setName} role={role} setRole={setRole} email={email} setEmail={setEmail} cidx={cidx} setCidx={setCidx} />
-        <button onClick={submit} disabled={!name.trim() || !role.trim()}
-          className="w-full bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors"
-        >
-          Add to Team
-        </button>
-      </div>
-    </BottomSheet>
-  );
-}
-
-/* ─── EditEmployeeModal ───────────────────────────────────── */
-function EditEmployeeModal({ employee, onSave, onDelete, onClose }: {
-  employee: Employee;
-  onSave: (updated: Employee) => void;
-  onDelete: (id: string) => void;
-  onClose: () => void;
-}) {
-  const [name, setName]   = useState(employee.name);
-  const [role, setRole]   = useState(employee.role);
-  const [email, setEmail] = useState(employee.email);
-  const [cidx, setCidx]   = useState(AVATAR_COLORS.indexOf(employee.color) >= 0 ? AVATAR_COLORS.indexOf(employee.color) : 0);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-
-  const save = () => {
-    if (!name.trim() || !role.trim()) return;
-    onSave({ ...employee, name, role, email, color: AVATAR_COLORS[cidx] });
-    onClose();
-  };
-
-  const handleDelete = () => {
-    onDelete(employee.id);
-    onClose();
-  };
-
-  return (
-    <BottomSheet onClose={onClose}>
-      <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100">
-        <h2 className="text-base font-bold text-slate-800">Edit Member</h2>
-        <div className="flex items-center gap-2">
-          <button onClick={() => setConfirmDelete(true)} className="w-8 h-8 rounded-full bg-red-50 flex items-center justify-center">
-            <Trash2 size={14} className="text-red-500" />
-          </button>
-          <button onClick={onClose} className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center">
-            <X size={15} className="text-slate-500" />
-          </button>
-        </div>
-      </div>
-
-      {confirmDelete ? (
-        <div className="p-6 flex flex-col items-center text-center gap-4">
-          <div className="w-14 h-14 rounded-full flex items-center justify-center text-white text-xl font-black" style={{ backgroundColor: AVATAR_COLORS[cidx] }}>
-            {initials(name)}
-          </div>
-          <div>
-            <p className="font-bold text-slate-800 text-base">Remove {name.split(" ")[0]}?</p>
-            <p className="text-sm text-slate-400 mt-1 leading-relaxed">
-              They'll be unassigned from all their tasks.
-            </p>
-          </div>
-          <div className="flex gap-3 w-full">
-            <button onClick={() => setConfirmDelete(false)} className="flex-1 py-3.5 rounded-2xl text-sm font-bold bg-slate-100 text-slate-600">
-              Cancel
-            </button>
-            <button onClick={handleDelete} className="flex-1 py-3.5 rounded-2xl text-sm font-bold bg-red-500 text-white">
-              Remove
-            </button>
-          </div>
-        </div>
-      ) : (
-        <div className="p-5 space-y-4">
-          <EmployeeFormFields name={name} setName={setName} role={role} setRole={setRole} email={email} setEmail={setEmail} cidx={cidx} setCidx={setCidx} />
-          <button onClick={save} disabled={!name.trim() || !role.trim()}
-            className="w-full bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors"
           >
             Save Changes
           </button>
@@ -836,8 +753,8 @@ function SwipeCard({
 }
 
 /* ─── DashboardView ───────────────────────────────────────── */
-function DashboardView({ tasks, employees, onView, onSelectMember, onOpenTask }: {
-  tasks: Task[]; employees: Employee[]; onView: (v: View) => void;
+function DashboardView({ tasks, employees, userName, onView, onSelectMember, onOpenTask }: {
+  tasks: Task[]; employees: Employee[]; userName: string; onView: (v: View) => void;
   onSelectMember: (id: string) => void; onOpenTask: (task: Task) => void;
 }) {
   const counts = {
@@ -853,7 +770,7 @@ function DashboardView({ tasks, employees, onView, onSelectMember, onOpenTask }:
     <div className="p-5">
       <div className="mb-6">
         <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Tuesday, July 22, 2026</p>
-        <h1 className="text-2xl font-black text-slate-800 mt-1 leading-tight">Good morning,<br />Alex 👋</h1>
+        <h1 className="text-2xl font-black text-slate-800 mt-1 leading-tight">Good morning,<br />{userName.split(" ")[0]} 👋</h1>
         <p className="text-sm text-slate-500 mt-2 leading-relaxed">Here's your team's progress today.</p>
       </div>
 
@@ -1068,9 +985,10 @@ function TeamMemberPage({ employee, tasks, onBack, onOpenTask }: {
 }
 
 /* ─── TasksView ───────────────────────────────────────────── */
-function TasksView({ tasks, employees, onStatus, onDelete, onEdit }: {
+function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
   tasks: Task[];
   employees: Employee[];
+  loading: boolean;
   onStatus: (id: string, s: TaskStatus) => void;
   onDelete: (id: string) => void;
   onEdit: (task: Task) => void;
@@ -1124,9 +1042,13 @@ function TasksView({ tasks, employees, onStatus, onDelete, onEdit }: {
         })}
       </div>
 
-      {filtered.length === 0 ? (
+      {loading ? (
         <div className="bg-white rounded-2xl p-10 text-center shadow-[0_1px_6px_rgba(15,23,42,0.06)]">
-          <p className="text-sm text-slate-400 font-medium">No tasks here yet.</p>
+          <Loader2 size={18} className="text-indigo-300 animate-spin mx-auto" />
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="bg-white rounded-2xl p-10 text-center shadow-[0_1px_6px_rgba(15,23,42,0.06)]">
+          <p className="text-sm text-slate-400 font-medium">{tasks.length === 0 ? "No tasks yet." : "No tasks here yet."}</p>
         </div>
       ) : (
         filtered.map(task => (
@@ -1145,20 +1067,71 @@ function TasksView({ tasks, employees, onStatus, onDelete, onEdit }: {
   );
 }
 
+/* ─── InviteEmployeeCard ──────────────────────────────────── */
+function InviteEmployeeCard({ orgId, onInvited }: { orgId: string; onInvited: () => void }) {
+  const [email, setEmail]         = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [result, setResult]       = useState<{ ok: boolean; msg: string } | null>(null);
+
+  const submit = async () => {
+    const trimmed = email.trim();
+    if (!trimmed) return;
+    setSubmitting(true);
+    setResult(null);
+    const { error } = await supabase
+      .from("memberships")
+      .insert({ org_id: orgId, email: trimmed, role: "employee" });
+    setSubmitting(false);
+    if (error) {
+      setResult({ ok: false, msg: error.message });
+      return;
+    }
+    setResult({ ok: true, msg: `Invite created for ${trimmed}. Share the app link with them manually — they'll set their password on first sign-in.` });
+    setEmail("");
+    onInvited();
+  };
+
+  return (
+    <div className="bg-white rounded-2xl shadow-[0_1px_6px_rgba(15,23,42,0.06)] p-4 mb-4">
+      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Add Employee</p>
+      <form
+        className="flex items-center gap-2"
+        onSubmit={e => { e.preventDefault(); submit(); }}
+      >
+        <input
+          type="email"
+          value={email}
+          onChange={e => { setEmail(e.target.value); setResult(null); }}
+          placeholder="employee@work.com"
+          className="flex-1 bg-slate-50 border border-slate-100 rounded-xl px-4 py-3 text-sm text-slate-800 placeholder:text-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500/25 focus:bg-white transition-all"
+        />
+        <button
+          type="submit"
+          disabled={!email.trim() || submitting}
+          className="w-11 h-11 rounded-xl bg-indigo-600 text-white flex items-center justify-center disabled:opacity-30 hover:bg-indigo-700 transition-colors flex-shrink-0"
+        >
+          {submitting ? <Loader2 size={16} className="animate-spin" /> : <Send size={15} />}
+        </button>
+      </form>
+      {result && (
+        <p className={`text-xs font-semibold mt-3 leading-relaxed ${result.ok ? "text-emerald-600" : "text-red-500"}`}>
+          {result.msg}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ─── SettingsView ────────────────────────────────────────── */
-function SettingsView({ tasks, employees, onAddEmployee, onEditEmployee, onDeleteEmployee, role, onSwitchRole, currentEmployeeId, onSwitchEmployee }: {
+function SettingsView({ tasks, employees, employeesLoading, ownerName, orgId, onInvited, onSignOut }: {
   tasks: Task[];
   employees: Employee[];
-  onAddEmployee: (e: Omit<Employee, "id">) => void;
-  onEditEmployee: (e: Employee) => void;
-  onDeleteEmployee: (id: string) => void;
-  role: AppRole;
-  onSwitchRole: (r: AppRole) => void;
-  currentEmployeeId: string;
-  onSwitchEmployee: (id: string) => void;
+  employeesLoading: boolean;
+  ownerName: string;
+  orgId: string;
+  onInvited: () => void;
+  onSignOut: () => void;
 }) {
-  const [showAdd, setShowAdd]         = useState(false);
-  const [editTarget, setEditTarget]   = useState<Employee | null>(null);
   const [notifs, setNotifs]           = useState(true);
   const [voiceRec, setVoiceRec]       = useState(true);
 
@@ -1168,49 +1141,20 @@ function SettingsView({ tasks, employees, onAddEmployee, onEditEmployee, onDelet
 
       {/* Owner card */}
       <div className="bg-indigo-600 rounded-2xl p-4 mb-4 flex items-center gap-3">
-        <div className="w-12 h-12 rounded-full bg-white/20 flex items-center justify-center text-white font-black text-lg flex-shrink-0">A</div>
-        <div className="flex-1">
-          <p className="font-black text-white">Alex Rivera</p>
+        <div className="w-12 h-12 rounded-full bg-white/20 flex items-center justify-center text-white font-black text-lg flex-shrink-0">
+          {ownerName ? ownerName[0].toUpperCase() : "?"}
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="font-black text-white truncate">{ownerName}</p>
           <p className="text-xs text-indigo-200 font-semibold">Business Owner</p>
         </div>
-        <div className="flex items-center gap-1 bg-white/20 px-3 py-1.5 rounded-xl">
+        <div className="flex items-center gap-1 bg-white/20 px-3 py-1.5 rounded-xl flex-shrink-0">
           <Shield size={11} className="text-white" />
           <span className="text-xs font-bold text-white">Admin</span>
         </div>
       </div>
 
-      {/* Preview as switcher */}
-      <div className="bg-white rounded-2xl shadow-[0_1px_6px_rgba(15,23,42,0.06)] p-4 mb-4">
-        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Preview App As</p>
-        <div className="flex gap-2 mb-3">
-          <button onClick={() => onSwitchRole("owner")}
-            className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all ${role === "owner" ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"}`}
-          >
-            Owner
-          </button>
-          <button onClick={() => onSwitchRole("employee")}
-            className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all ${role === "employee" ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"}`}
-          >
-            Employee
-          </button>
-        </div>
-        {role === "employee" && (
-          <div className="flex flex-wrap gap-2">
-            {employees.map(emp => (
-              <button key={emp.id} onClick={() => onSwitchEmployee(emp.id)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
-                  currentEmployeeId === emp.id ? "bg-indigo-50 text-indigo-700 ring-2 ring-indigo-400" : "bg-slate-100 text-slate-600"
-                }`}
-              >
-                <span className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[10px] font-black" style={{ backgroundColor: emp.color }}>
-                  {initials(emp.name)}
-                </span>
-                {emp.name.split(" ")[0]}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
+      <InviteEmployeeCard orgId={orgId} onInvited={onInvited} />
 
       {/* Preferences */}
       <div className="bg-white rounded-2xl shadow-[0_1px_6px_rgba(15,23,42,0.06)] divide-y divide-slate-100 mb-4">
@@ -1239,11 +1183,7 @@ function SettingsView({ tasks, employees, onAddEmployee, onEditEmployee, onDelet
       <div className="mb-4">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-black text-slate-700 uppercase tracking-wide">Team Members</h2>
-          <button onClick={() => setShowAdd(true)}
-            className="flex items-center gap-1.5 bg-indigo-600 text-white px-3 py-1.5 rounded-xl text-xs font-bold shadow-sm shadow-indigo-600/20"
-          >
-            <UserPlus size={12} /> Add
-          </button>
+          {employeesLoading && <Loader2 size={13} className="text-slate-300 animate-spin" />}
         </div>
 
         <div className="space-y-2">
@@ -1256,44 +1196,30 @@ function SettingsView({ tasks, employees, onAddEmployee, onEditEmployee, onDelet
                   {initials(emp.name)}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-bold text-slate-800 truncate">{emp.name}</p>
-                  <p className="text-[11px] text-slate-400 font-semibold">{emp.role}</p>
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-sm font-bold text-slate-800 truncate">{emp.name}</p>
+                    {emp.pending && (
+                      <span className="text-[9px] font-black uppercase tracking-wide bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-full flex-shrink-0">
+                        Pending
+                      </span>
+                    )}
+                  </div>
                   {emp.email && <p className="text-[11px] text-slate-300 font-mono truncate">{emp.email}</p>}
                 </div>
-                <div className="flex items-center gap-1.5 flex-shrink-0">
-                  {active > 0 && (
-                    <span className="text-[11px] font-bold bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full">
-                      {active} active
-                    </span>
-                  )}
-                  {/* Edit */}
-                  <button
-                    onClick={() => setEditTarget(emp)}
-                    className="w-8 h-8 rounded-full hover:bg-indigo-50 flex items-center justify-center transition-colors group"
-                  >
-                    <Pencil size={13} className="text-slate-300 group-hover:text-indigo-500 transition-colors" />
-                  </button>
-                  {/* Delete */}
-                  <button
-                    onClick={() => {
-                      setEditTarget(emp);
-                      // open edit modal with confirm delete pre-shown via a flag
-                    }}
-                    className="w-8 h-8 rounded-full hover:bg-red-50 flex items-center justify-center transition-colors group"
-                    style={{ display: "none" }} // hidden — delete is inside edit modal
-                  >
-                    <Trash2 size={13} className="text-slate-300 group-hover:text-red-400 transition-colors" />
-                  </button>
-                </div>
+                {active > 0 && (
+                  <span className="text-[11px] font-bold bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full flex-shrink-0">
+                    {active} active
+                  </span>
+                )}
               </div>
             );
           })}
 
-          {employees.length === 0 && (
+          {!employeesLoading && employees.length === 0 && (
             <div className="bg-white rounded-2xl p-8 text-center shadow-[0_1px_6px_rgba(15,23,42,0.06)]">
               <Users size={24} className="text-slate-300 mx-auto mb-2" />
               <p className="text-sm text-slate-400 font-medium">No team members yet.</p>
-              <p className="text-xs text-slate-300 mt-1">Tap "Add" to invite your first employee.</p>
+              <p className="text-xs text-slate-300 mt-1">Invite your first employee above.</p>
             </div>
           )}
         </div>
@@ -1316,20 +1242,13 @@ function SettingsView({ tasks, employees, onAddEmployee, onEditEmployee, onDelet
         </div>
       </div>
 
-      {showAdd && (
-        <AddEmployeeModal
-          onAdd={data => { onAddEmployee(data); setShowAdd(false); }}
-          onClose={() => setShowAdd(false)}
-        />
-      )}
-      {editTarget && (
-        <EditEmployeeModal
-          employee={editTarget}
-          onSave={updated => { onEditEmployee(updated); setEditTarget(null); }}
-          onDelete={id => { onDeleteEmployee(id); setEditTarget(null); }}
-          onClose={() => setEditTarget(null)}
-        />
-      )}
+      <button
+        type="button"
+        onClick={onSignOut}
+        className="w-full flex items-center justify-center gap-2 bg-white rounded-2xl shadow-[0_1px_6px_rgba(15,23,42,0.06)] py-3.5 mt-4 text-sm font-bold text-red-500 hover:bg-red-50 transition-colors"
+      >
+        <LogOut size={15} /> Sign Out
+      </button>
     </div>
   );
 }
@@ -1411,10 +1330,11 @@ function EmployeeTaskCard({
 }
 
 /* ─── EmployeeTasksView ───────────────────────────────────── */
-function EmployeeTasksView({ tasks, employees, currentEmployeeId, onStatus, onReorder, onOpenTask }: {
+function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onStatus, onReorder, onOpenTask }: {
   tasks: Task[];
   employees: Employee[];
   currentEmployeeId: string;
+  loading: boolean;
   onStatus: (id: string, s: TaskStatus) => void;
   onReorder: (assigneeId: string | null, orderedIds: string[]) => void;
   onOpenTask: (task: Task) => void;
@@ -1472,7 +1392,11 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, onStatus, onRe
         <p className="text-[11px] text-indigo-400 font-semibold mb-3 -mt-1">Use ▲▼ to arrange tasks in your own order</p>
       )}
 
-      {sorted.length === 0 ? (
+      {loading ? (
+        <div className="bg-white rounded-2xl p-10 text-center shadow-[0_1px_6px_rgba(15,23,42,0.06)]">
+          <Loader2 size={18} className="text-indigo-300 animate-spin mx-auto" />
+        </div>
+      ) : sorted.length === 0 ? (
         <div className="bg-white rounded-2xl p-10 text-center shadow-[0_1px_6px_rgba(15,23,42,0.06)]">
           <p className="text-sm text-slate-400 font-medium">No tasks assigned to you yet.</p>
         </div>
@@ -1704,13 +1628,12 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, onStatus, onRea
 }
 
 /* ─── EmployeeProfileView ─────────────────────────────────── */
-function EmployeeProfileView({ tasks, employees, currentEmployeeId, onSwitchEmployee, role, onSwitchRole }: {
+function EmployeeProfileView({ tasks, employees, currentEmployeeId, employeeEmail, onSignOut }: {
   tasks: Task[];
   employees: Employee[];
   currentEmployeeId: string;
-  onSwitchEmployee: (id: string) => void;
-  role: AppRole;
-  onSwitchRole: (r: AppRole) => void;
+  employeeEmail: string;
+  onSignOut: () => void;
 }) {
   const me = employees.find(e => e.id === currentEmployeeId);
   const myTasks = tasks.filter(t => t.assigneeId === currentEmployeeId);
@@ -1724,69 +1647,119 @@ function EmployeeProfileView({ tasks, employees, currentEmployeeId, onSwitchEmpl
         <div className="w-12 h-12 rounded-full bg-white/20 flex items-center justify-center text-white font-black text-lg flex-shrink-0">
           {me ? initials(me.name) : "?"}
         </div>
-        <div className="flex-1">
-          <p className="font-black text-white">{me?.name ?? "—"}</p>
-          <p className="text-xs text-indigo-200 font-semibold">{me?.role ?? "Employee"}</p>
+        <div className="flex-1 min-w-0">
+          <p className="font-black text-white truncate">{me?.name ?? employeeEmail}</p>
+          <p className="text-xs text-indigo-200 font-semibold truncate">{me?.role ?? employeeEmail}</p>
         </div>
-        <div className="text-right">
+        <div className="text-right flex-shrink-0">
           <p className="text-lg font-black text-white">{done}/{myTasks.length}</p>
           <p className="text-[10px] text-indigo-200 font-semibold">done</p>
         </div>
       </div>
 
-      {/* Preview as switcher */}
-      <div className="bg-white rounded-2xl shadow-[0_1px_6px_rgba(15,23,42,0.06)] p-4">
-        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Preview App As</p>
-        <div className="flex gap-2 mb-3">
-          <button onClick={() => onSwitchRole("owner")}
-            className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all ${role === "owner" ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"}`}
-          >
-            Owner
-          </button>
-          <button onClick={() => onSwitchRole("employee")}
-            className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all ${role === "employee" ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"}`}
-          >
-            Employee
-          </button>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {employees.map(emp => (
-            <button key={emp.id} onClick={() => onSwitchEmployee(emp.id)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
-                currentEmployeeId === emp.id ? "bg-indigo-50 text-indigo-700 ring-2 ring-indigo-400" : "bg-slate-100 text-slate-600"
-              }`}
-            >
-              <span className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[10px] font-black" style={{ backgroundColor: emp.color }}>
-                {initials(emp.name)}
-              </span>
-              {emp.name.split(" ")[0]}
-            </button>
-          ))}
-        </div>
-      </div>
+      <button
+        type="button"
+        onClick={onSignOut}
+        className="w-full flex items-center justify-center gap-2 bg-white rounded-2xl shadow-[0_1px_6px_rgba(15,23,42,0.06)] py-3.5 text-sm font-bold text-red-500 hover:bg-red-50 transition-colors"
+      >
+        <LogOut size={15} /> Sign Out
+      </button>
     </div>
   );
 }
 
-/* ─── App ─────────────────────────────────────────────────── */
-export default function App() {
-  const [role, setRole]           = useState<AppRole>("owner");
-  const [currentEmployeeId, setCurrentEmployeeId] = useState<string>("e1");
-  const [view, setView]           = useState<View>("dashboard");
-  const [tasks, setTasks]         = useState<Task[]>(INIT_TASKS);
-  const [employees, setEmployees] = useState<Employee[]>(INIT_EMPLOYEES);
+/* ─── AuthenticatedApp ────────────────────────────────────── *
+ * Renders once we know the signed-in user's real role & org.
+ * `employees` and `tasks` (with their comments) are both live
+ * queries against Supabase. `currentEmployeeId` is the signed-in
+ * user's own real membership id (from useAuth), not a guess by
+ * email match or array index. */
+function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
+  const { user, membershipId, membershipEmail, fullName, signOut } = useAuth();
+  const [view, setView]           = useState<View>(role === "owner" ? "dashboard" : "tasks");
+  const [tasks, setTasks]         = useState<Task[]>([]);
+  const [tasksLoading, setTasksLoading] = useState(true);
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [employeesLoading, setEmployeesLoading] = useState(true);
   const [showAdd, setShowAdd]     = useState(false);
   const [editTask, setEditTask]   = useState<Task | null>(null);
-  const [showAddMemberInline, setShowAddMemberInline] = useState(false);
   const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null);
   const [toast, setToast]         = useState<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // When switching into employee mode, land on "tasks" (no dashboard for employees)
-  const switchRole = (r: AppRole) => {
-    setRole(r);
-    setView(r === "employee" ? "tasks" : "dashboard");
-  };
+  const currentEmployeeId = membershipId ?? "";
+
+  const fetchEmployees = useCallback(async () => {
+    setEmployeesLoading(true);
+    const { data, error } = await supabase
+      .from("memberships")
+      .select("id, email, full_name, role, user_id")
+      .eq("org_id", orgId)
+      .eq("role", "employee")
+      .order("invited_at", { ascending: true });
+    if (!error && data) {
+      setEmployees(data.map(toEmployee));
+    }
+    setEmployeesLoading(false);
+  }, [orgId]);
+
+  useEffect(() => { fetchEmployees(); }, [fetchEmployees]);
+
+  // Tasks + their comments, both live against Supabase. Comments are
+  // fetched in a second query keyed off the task ids from the first —
+  // there's no org_id on `comments` directly — and merged in client-side
+  // so every task card (not just an opened one) has a real comment count.
+  const fetchTasks = useCallback(async () => {
+    setTasksLoading(true);
+    const { data: taskRows, error: tasksError } = await supabase
+      .from("tasks")
+      .select("id, title, description, assignee_id, created_by, status, priority, due_date, voice_note_url, image_urls, sort_order, created_at")
+      .eq("org_id", orgId)
+      .order("sort_order", { ascending: true });
+
+    if (tasksError || !taskRows) {
+      setTasks([]);
+      setTasksLoading(false);
+      return;
+    }
+
+    const taskIds = taskRows.map(t => t.id);
+    let commentsByTask = new Map<string, Comment[]>();
+    if (taskIds.length > 0) {
+      const { data: commentRows, error: commentsError } = await supabase
+        .from("comments")
+        .select("id, task_id, author_id, text, image_urls, created_at")
+        .in("task_id", taskIds)
+        .order("created_at", { ascending: true });
+      if (!commentsError && commentRows) {
+        commentsByTask = commentRows.reduce((map, c) => {
+          const list = map.get(c.task_id) ?? [];
+          list.push(toComment(c));
+          map.set(c.task_id, list);
+          return map;
+        }, new Map<string, Comment[]>());
+      }
+    }
+
+    setTasks(taskRows.map(t => toTask(t, commentsByTask.get(t.id) ?? [])));
+    setTasksLoading(false);
+  }, [orgId]);
+
+  useEffect(() => { fetchTasks(); }, [fetchTasks]);
+
+  // Cross-profile sync: whenever this tab/window regains focus, re-pull
+  // tasks (and every task's comments, since they're fetched together)
+  // so a change made from another signed-in device/tab shows up here
+  // without needing realtime subscriptions.
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === "visible") fetchTasks(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", fetchTasks);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", fetchTasks);
+    };
+  }, [fetchTasks]);
 
   const showToast = (msg: string) => {
     setToast(msg);
@@ -1794,69 +1767,92 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), 3000);
   };
 
-  const handleStatus = (id: string, status: TaskStatus) => {
-    setTasks(ts => ts.map(t => t.id === id ? { ...t, status } : t));
+  // Every mutation below hits Supabase first, then re-pulls the full task
+  // list (fetchTasks) so the acting user's own screen reflects the change
+  // immediately — same refetch path the focus/visibility listener uses for
+  // cross-profile sync. Voice notes and image attachments are intentionally
+  // left out of every insert/update payload: the picker/recorder above only
+  // ever produce local blob: URLs (no upload step yet), so sending them
+  // would overwrite voice_note_url/image_urls with values nobody else could
+  // load — that wiring is a separate milestone.
+  const handleStatus = async (id: string, status: TaskStatus) => {
+    const { error } = await supabase.from("tasks").update({ status }).eq("id", id);
+    if (error) { showToast(error.message); return; }
+    await fetchTasks();
     showToast(status === "done" ? "Marked complete!" : "Status updated");
   };
-  const handleDeleteTask = (id: string) => {
-    setTasks(ts => ts.filter(t => t.id !== id));
+  const handleDeleteTask = async (id: string) => {
+    const { error } = await supabase.from("tasks").delete().eq("id", id);
+    if (error) { showToast(error.message); return; }
+    await fetchTasks();
     showToast("Task deleted");
   };
-  const handleSaveTask = (updated: Task) => {
-    setTasks(ts => ts.map(t => t.id === updated.id ? updated : t));
+  const handleSaveTask = async (updated: Task) => {
+    const { error } = await supabase
+      .from("tasks")
+      .update({
+        title: updated.title,
+        description: updated.description,
+        assignee_id: updated.assigneeId,
+        status: updated.status,
+        priority: updated.priority,
+        due_date: updated.dueDate || null,
+      })
+      .eq("id", updated.id);
+    if (error) { showToast(error.message); return; }
+    await fetchTasks();
     showToast("Task saved");
   };
-  const handleAddTask = (data: Omit<Task, "id" | "createdAt" | "comments" | "order">) => {
-    setTasks(ts => {
-      const siblingOrders = ts.filter(t => t.assigneeId === data.assigneeId).map(t => t.order);
-      const nextOrder = siblingOrders.length ? Math.max(...siblingOrders) + 1 : 0;
-      return [{ ...data, id: mkId(), createdAt: "2026-07-22", comments: [], order: nextOrder }, ...ts];
+  const handleAddTask = async (data: Omit<Task, "id" | "createdAt" | "comments" | "order">) => {
+    const { error } = await supabase.from("tasks").insert({
+      org_id: orgId,
+      title: data.title,
+      description: data.description,
+      assignee_id: data.assigneeId,
+      created_by: currentEmployeeId || null,
+      status: data.status,
+      priority: data.priority,
+      due_date: data.dueDate || null,
     });
-    if (data.assigneeId && data.assigneeId !== data.createdById) {
+    if (error) { showToast(error.message); return; }
+    await fetchTasks();
+    if (data.assigneeId && data.assigneeId !== currentEmployeeId) {
       const emp = employees.find(e => e.id === data.assigneeId);
       if (emp) { showToast(`Notified ${emp.name} 🔔`); return; }
     }
     showToast("Task created");
   };
 
-  const handleAddComment = (taskId: string, authorId: string, text: string, imageUrls?: string[]) => {
+  const handleAddComment = async (taskId: string, authorId: string, text: string, imageUrls?: string[]) => {
     const trimmed = text.trim();
     const hasImages = imageUrls && imageUrls.length > 0;
     if (!trimmed && !hasImages) return;
-    setTasks(ts => ts.map(t => t.id === taskId
-      ? { ...t, comments: [...t.comments, { id: mkId(), authorId, text: trimmed, createdAt: "2026-07-22", ...(hasImages ? { imageUrls } : {}) }] }
-      : t
-    ));
+    const { error } = await supabase.from("comments").insert({
+      task_id: taskId,
+      author_id: authorId,
+      text: trimmed,
+    });
+    if (error) { showToast(error.message); return; }
+    await fetchTasks();
   };
 
-  const handleReassign = (taskId: string, newAssigneeId: string) => {
-    setTasks(ts => ts.map(t => t.id === taskId ? { ...t, assigneeId: newAssigneeId } : t));
+  const handleReassign = async (taskId: string, newAssigneeId: string) => {
+    const { error } = await supabase.from("tasks").update({ assignee_id: newAssigneeId }).eq("id", taskId);
+    if (error) { showToast(error.message); return; }
+    await fetchTasks();
     const emp = employees.find(e => e.id === newAssigneeId);
     showToast(emp ? `Reassigned to ${emp.name.split(" ")[0]}` : "Reassigned");
   };
 
-  const handleReorder = (assigneeId: string | null, orderedIds: string[]) => {
-    setTasks(ts => ts.map(t => {
-      if (t.assigneeId !== assigneeId) return t;
-      const idx = orderedIds.indexOf(t.id);
-      return idx === -1 ? t : { ...t, order: idx };
-    }));
+  const handleReorder = async (_assigneeId: string | null, orderedIds: string[]) => {
+    const results = await Promise.all(
+      orderedIds.map((id, idx) => supabase.from("tasks").update({ sort_order: idx }).eq("id", id))
+    );
+    const failed = results.find(r => r.error);
+    if (failed?.error) { showToast(failed.error.message); return; }
+    await fetchTasks();
   };
 
-  const handleAddEmployee = (data: Omit<Employee, "id">) => {
-    setEmployees(es => [...es, { ...data, id: mkId() }]);
-    showToast(`${data.name} added to team!`);
-  };
-  const handleEditEmployee = (updated: Employee) => {
-    setEmployees(es => es.map(e => e.id === updated.id ? updated : e));
-    showToast("Member updated");
-  };
-  const handleDeleteEmployee = (id: string) => {
-    const emp = employees.find(e => e.id === id);
-    setEmployees(es => es.filter(e => e.id !== id));
-    setTasks(ts => ts.map(t => t.assigneeId === id ? { ...t, assigneeId: null } : t));
-    showToast(`${emp?.name.split(" ")[0] ?? "Member"} removed`);
-  };
 
   const NAV = role === "owner"
     ? [
@@ -1873,17 +1869,6 @@ export default function App() {
 
   return (
     <>
-      <style>{`
-        body { font-family: 'DM Sans', system-ui, sans-serif; }
-        .hide-scroll::-webkit-scrollbar { display: none; }
-        .hide-scroll { -ms-overflow-style: none; scrollbar-width: none; }
-        @keyframes slideDown {
-          from { transform: translateY(-12px); opacity: 0; }
-          to   { transform: translateY(0);     opacity: 1; }
-        }
-        .toast-in { animation: slideDown 0.25s cubic-bezier(0.32,0.72,0,1) forwards; }
-      `}</style>
-
       <div className="size-full flex items-center justify-center bg-slate-300/50">
         <div className="relative w-full max-w-[430px] h-full max-h-[900px] flex flex-col bg-[#EEF0F7] overflow-hidden shadow-2xl shadow-slate-900/20">
 
@@ -1901,25 +1886,26 @@ export default function App() {
           <div className="flex-1 overflow-y-auto pb-24 hide-scroll">
             {role === "owner" && view === "dashboard" && (
               <DashboardView
-                tasks={tasks} employees={employees} onView={setView}
+                tasks={tasks} employees={employees}
+                userName={fullName?.trim() || user?.email || ""}
+                onView={setView}
                 onSelectMember={setSelectedMemberId}
                 onOpenTask={task => setEditTask(task)}
               />
             )}
             {role === "owner" && view === "tasks" && (
               <TasksView
-                tasks={tasks} employees={employees}
+                tasks={tasks} employees={employees} loading={tasksLoading}
                 onStatus={handleStatus} onDelete={handleDeleteTask} onEdit={setEditTask}
               />
             )}
             {role === "owner" && view === "settings" && (
               <SettingsView
-                tasks={tasks} employees={employees}
-                onAddEmployee={handleAddEmployee}
-                onEditEmployee={handleEditEmployee}
-                onDeleteEmployee={handleDeleteEmployee}
-                role={role} onSwitchRole={switchRole}
-                currentEmployeeId={currentEmployeeId} onSwitchEmployee={setCurrentEmployeeId}
+                tasks={tasks} employees={employees} employeesLoading={employeesLoading}
+                ownerName={fullName?.trim() || user?.email || ""}
+                orgId={orgId}
+                onInvited={fetchEmployees}
+                onSignOut={signOut}
               />
             )}
 
@@ -1927,6 +1913,7 @@ export default function App() {
               <EmployeeTasksView
                 tasks={tasks} employees={employees}
                 currentEmployeeId={currentEmployeeId}
+                loading={tasksLoading}
                 onStatus={handleStatus}
                 onReorder={handleReorder}
                 onOpenTask={setEditTask}
@@ -1935,8 +1922,9 @@ export default function App() {
             {role === "employee" && view === "settings" && (
               <EmployeeProfileView
                 tasks={tasks} employees={employees}
-                currentEmployeeId={currentEmployeeId} onSwitchEmployee={setCurrentEmployeeId}
-                role={role} onSwitchRole={switchRole}
+                currentEmployeeId={currentEmployeeId}
+                employeeEmail={membershipEmail ?? user?.email ?? ""}
+                onSignOut={signOut}
               />
             )}
           </div>
@@ -1994,8 +1982,6 @@ export default function App() {
           employees={employees}
           defaultAssigneeId={role === "employee" ? currentEmployeeId : null}
           assignLabel={role === "employee" ? "Assign to yourself or a teammate" : undefined}
-          isOwner={role === "owner"}
-          onAddMember={() => setShowAddMemberInline(true)}
           onAdd={handleAddTask}
           onClose={() => setShowAdd(false)}
         />
@@ -2004,16 +1990,9 @@ export default function App() {
         <EditTaskModal
           task={editTask}
           employees={employees}
-          onAddMember={() => setShowAddMemberInline(true)}
           onSave={handleSaveTask}
           onDelete={id => { handleDeleteTask(id); setEditTask(null); }}
           onClose={() => setEditTask(null)}
-        />
-      )}
-      {showAddMemberInline && (
-        <AddEmployeeModal
-          onAdd={data => { handleAddEmployee(data); setShowAddMemberInline(false); }}
-          onClose={() => setShowAddMemberInline(false)}
         />
       )}
       {editTask && role === "employee" && (
@@ -2026,6 +2005,69 @@ export default function App() {
           onAddComment={handleAddComment}
           onClose={() => setEditTask(null)}
         />
+      )}
+    </>
+  );
+}
+
+/* ─── LoadingScreen ───────────────────────────────────────── */
+function LoadingScreen() {
+  return (
+    <div className="size-full flex items-center justify-center bg-slate-300/50">
+      <div className="relative w-full max-w-[430px] h-full max-h-[900px] flex items-center justify-center bg-[#EEF0F7] overflow-hidden shadow-2xl shadow-slate-900/20">
+        <Loader2 size={22} className="text-indigo-400 animate-spin" />
+      </div>
+    </div>
+  );
+}
+
+/* ─── App ─────────────────────────────────────────────────── *
+ * Top-level auth gate: shows the auth screen when signed out,
+ * a "no access" screen when signed in but unaffiliated with an
+ * org, and the real app once we have a role + org to render it
+ * with. Real role/org come from `useAuth()` — no more manual
+ * "Preview App As" switcher. */
+export default function App() {
+  const { user, role, orgId, loading, noMembership, needsProfile } = useAuth();
+
+  // DEBUG: fires on every render of the gate — shows the exact state combo
+  // that decided which screen got shown, and whether this render happened
+  // while the membership query was still in flight (loading=true) vs after
+  // it resolved.
+  console.log("[App gate] render", {
+    loading,
+    hasUser: !!user,
+    userId: user?.id ?? null,
+    role,
+    orgId,
+    noMembership,
+    needsProfile,
+    decision: loading ? "LoadingScreen" : !user ? "AuthScreen" : (noMembership || !role || !orgId) ? "NoOrgAccess" : needsProfile ? "CompleteProfileScreen" : "AuthenticatedApp",
+  });
+
+  return (
+    <>
+      <style>{`
+        body { font-family: 'DM Sans', system-ui, sans-serif; }
+        .hide-scroll::-webkit-scrollbar { display: none; }
+        .hide-scroll { -ms-overflow-style: none; scrollbar-width: none; }
+        @keyframes slideDown {
+          from { transform: translateY(-12px); opacity: 0; }
+          to   { transform: translateY(0);     opacity: 1; }
+        }
+        .toast-in { animation: slideDown 0.25s cubic-bezier(0.32,0.72,0,1) forwards; }
+      `}</style>
+
+      {loading ? (
+        <LoadingScreen />
+      ) : !user ? (
+        <AuthScreen />
+      ) : noMembership || !role || !orgId ? (
+        <NoOrgAccess />
+      ) : needsProfile ? (
+        <CompleteProfileScreen />
+      ) : (
+        <AuthenticatedApp role={role} orgId={orgId} />
       )}
     </>
   );

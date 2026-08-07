@@ -1,7 +1,7 @@
 
-  # Mobile Task Assignment App
+  # whynotch
 
-  This is a code bundle for Mobile Task Assignment App. The original project is available at https://www.figma.com/design/If9xiRmXSh7uF762mIYvuw/Mobile-Task-Assignment-App.
+  This is a code bundle for whynotch, a mobile-first task assignment app. The original project is available at https://www.figma.com/design/If9xiRmXSh7uF762mIYvuw/Mobile-Task-Assignment-App.
 
   ## Running the code
 
