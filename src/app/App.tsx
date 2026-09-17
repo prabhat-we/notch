@@ -10,6 +10,8 @@ import AuthScreen from "./auth/AuthScreen";
 import NoOrgAccess from "./auth/NoOrgAccess";
 import CompleteProfileScreen from "./auth/CompleteProfileScreen";
 import { supabase } from "../lib/supabase";
+import { getToday } from "../lib/date";
+import { format, addDays } from "date-fns";
 
 
 /* ─── Types ───────────────────────────────────────────────── */
@@ -66,15 +68,14 @@ const AVATAR_COLORS = ["#7C3AED","#0891B2","#059669","#DC2626","#D97706","#4F46E
 
 /* ─── Helpers ─────────────────────────────────────────────── */
 const initials = (n: string) => n.split(" ").map(p => p[0]).join("").toUpperCase().slice(0, 2);
-const TODAY = new Date("2026-07-22");
 function relDate(d: string) {
-  const diff = Math.floor((new Date(d).getTime() - TODAY.getTime()) / 86400000);
+  const diff = Math.floor((new Date(d).getTime() - getToday().getTime()) / 86400000);
   if (diff === 0) return "Today";
   if (diff === 1) return "Tomorrow";
   if (diff < 0) return `${Math.abs(diff)}d overdue`;
   return `${diff}d left`;
 }
-const isOverdue = (d: string, s: TaskStatus) => new Date(d) < TODAY && s !== "done";
+const isOverdue = (d: string, s: TaskStatus) => new Date(d) < getToday() && s !== "done";
 const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
 // Deterministic avatar color from a membership id — there's no color-picker UI
@@ -471,7 +472,7 @@ function AddTaskModal({ employees, defaultAssigneeId, assignLabel, onAdd, onClos
   const [desc, setDesc]             = useState("");
   const [assigneeId, setAssigneeId] = useState<string | null>(defaultAssigneeId ?? null);
   const [priority, setPriority]     = useState<Priority>("medium");
-  const [dueDate, setDueDate]       = useState("2026-07-25");
+  const [dueDate, setDueDate]       = useState(() => addDays(getToday(), 3).toISOString().slice(0, 10));
   const [status, setStatus]         = useState<TaskStatus>("todo");
   const [voiceNoteUrl, setVoice]    = useState<string | null>(null);
   const [imageUrls, setImageUrls]   = useState<string[]>([]);
@@ -769,7 +770,7 @@ function DashboardView({ tasks, employees, userName, onView, onSelectMember, onO
   return (
     <div className="p-5">
       <div className="mb-6">
-        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Tuesday, July 22, 2026</p>
+        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">{format(new Date(), "EEEE, MMMM d, yyyy")}</p>
         <h1 className="text-2xl font-black text-slate-800 mt-1 leading-tight">Good morning,<br />{userName.split(" ")[0]} 👋</h1>
         <p className="text-sm text-slate-500 mt-2 leading-relaxed">Here's your team's progress today.</p>
       </div>
@@ -1370,7 +1371,7 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
   return (
     <div className="p-5">
       <div className="mb-4">
-        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Tuesday, July 22, 2026</p>
+        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">{format(new Date(), "EEEE, MMMM d, yyyy")}</p>
         <h1 className="text-xl font-black text-slate-800 mt-1">
           {me ? `${me.name.split(" ")[0]}'s Tasks` : "My Tasks"}
         </h1>
