@@ -998,6 +998,8 @@ function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
   const [playingUrl, setPlayingUrl] = useState<string | null>(null);
 
   const filtered = filter === "all" ? tasks : tasks.filter(t => t.status === filter);
+  const activeFiltered = filtered.filter(t => t.status !== "done");
+  const doneFiltered = filtered.filter(t => t.status === "done");
   const tabs: { id: TaskStatus | "all"; label: string }[] = [
     { id: "all", label: "All" },
     { id: "todo", label: "To Do" },
@@ -1051,17 +1053,33 @@ function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
           <p className="text-sm text-slate-400 font-medium">{tasks.length === 0 ? "No tasks yet." : "No tasks here yet."}</p>
         </div>
       ) : (
-        filtered.map(task => (
-          <SwipeCard
-            key={task.id}
-            task={task}
-            employees={employees}
-            onStatus={onStatus}
-            onDelete={onDelete}
-            onEdit={onEdit}
-            onVoicePlay={handleVoicePlay}
-          />
-        ))
+        <>
+          {activeFiltered.map(task => (
+            <SwipeCard
+              key={task.id}
+              task={task}
+              employees={employees}
+              onStatus={onStatus}
+              onDelete={onDelete}
+              onEdit={onEdit}
+              onVoicePlay={handleVoicePlay}
+            />
+          ))}
+          {activeFiltered.length > 0 && doneFiltered.length > 0 && (
+            <h2 className="text-sm font-black text-slate-700 uppercase tracking-wide mb-2 mt-1">Done</h2>
+          )}
+          {doneFiltered.map(task => (
+            <SwipeCard
+              key={task.id}
+              task={task}
+              employees={employees}
+              onStatus={onStatus}
+              onDelete={onDelete}
+              onEdit={onEdit}
+              onVoicePlay={handleVoicePlay}
+            />
+          ))}
+        </>
       )}
     </div>
   );
@@ -1351,6 +1369,8 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
     if (sortMode === "dueDate") return a.dueDate.localeCompare(b.dueDate);
     return a.order - b.order; // custom
   });
+  const activeSorted = sorted.filter(t => t.status !== "done");
+  const doneSorted = sorted.filter(t => t.status === "done");
 
   const move = (id: string, dir: -1 | 1) => {
     const ids = sorted.map(t => t.id);
@@ -1401,20 +1421,45 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
           <p className="text-sm text-slate-400 font-medium">No tasks assigned to you yet.</p>
         </div>
       ) : (
-        sorted.map((task, i) => (
-          <EmployeeTaskCard
-            key={task.id}
-            task={task}
-            employees={employees}
-            isSelf
-            sortMode={sortMode}
-            canMoveUp={i > 0}
-            canMoveDown={i < sorted.length - 1}
-            onStatus={onStatus}
-            onOpen={onOpenTask}
-            onMove={move}
-          />
-        ))
+        <>
+          {activeSorted.map(task => {
+            const i = sorted.indexOf(task);
+            return (
+              <EmployeeTaskCard
+                key={task.id}
+                task={task}
+                employees={employees}
+                isSelf
+                sortMode={sortMode}
+                canMoveUp={i > 0}
+                canMoveDown={i < sorted.length - 1}
+                onStatus={onStatus}
+                onOpen={onOpenTask}
+                onMove={move}
+              />
+            );
+          })}
+          {activeSorted.length > 0 && doneSorted.length > 0 && (
+            <h2 className="text-sm font-black text-slate-700 uppercase tracking-wide mb-2.5 mt-1">Done</h2>
+          )}
+          {doneSorted.map(task => {
+            const i = sorted.indexOf(task);
+            return (
+              <EmployeeTaskCard
+                key={task.id}
+                task={task}
+                employees={employees}
+                isSelf
+                sortMode={sortMode}
+                canMoveUp={i > 0}
+                canMoveDown={i < sorted.length - 1}
+                onStatus={onStatus}
+                onOpen={onOpenTask}
+                onMove={move}
+              />
+            );
+          })}
+        </>
       )}
     </div>
   );
