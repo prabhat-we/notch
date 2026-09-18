@@ -522,13 +522,15 @@ function AddTaskModal({ employees, defaultAssigneeId, assignLabel, onAdd, onClos
 }
 
 /* ─── EditTaskModal ───────────────────────────────────────── */
-function EditTaskModal({ task, employees, onSave, onDelete, onClose }: {
+function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: {
   task: Task;
   employees: Employee[];
+  canEdit: boolean;
   onSave: (updated: Task) => void;
   onDelete: (id: string) => void;
   onClose: () => void;
 }) {
+  const [mode, setMode]             = useState<"view" | "edit">("view");
   const [title, setTitle]           = useState(task.title);
   const [desc, setDesc]             = useState(task.description);
   const [assigneeId, setAssigneeId] = useState<string | null>(task.assigneeId);
@@ -538,11 +540,29 @@ function EditTaskModal({ task, employees, onSave, onDelete, onClose }: {
   const [voiceNoteUrl, setVoice]    = useState<string | null>(task.voiceNoteUrl);
   const [imageUrls, setImageUrls]   = useState<string[]>(task.imageUrls);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+
+  const assignee = employees.find(e => e.id === task.assigneeId);
+  const done = task.status === "done";
+
+  const startEdit = () => {
+    setTitle(task.title);
+    setDesc(task.description);
+    setAssigneeId(task.assigneeId);
+    setPriority(task.priority);
+    setDueDate(task.dueDate);
+    setStatus(task.status);
+    setVoice(task.voiceNoteUrl);
+    setImageUrls(task.imageUrls);
+    setMode("edit");
+  };
+
+  const cancel = () => setMode("view");
 
   const save = () => {
     if (!title.trim()) return;
     onSave({ ...task, title, description: desc, assigneeId, priority, dueDate, status, voiceNoteUrl, imageUrls });
-    onClose();
+    setMode("view");
   };
 
   const handleDelete = () => {
@@ -551,16 +571,19 @@ function EditTaskModal({ task, employees, onSave, onDelete, onClose }: {
   };
 
   return (
+    <>
     <BottomSheet onClose={onClose}>
       <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100 flex-shrink-0">
-        <h2 className="text-base font-bold text-slate-800">Edit Task</h2>
+        <h2 className="text-base font-bold text-slate-800">{mode === "edit" ? "Edit Task" : "Task Details"}</h2>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setConfirmDelete(true)}
-            className="w-8 h-8 rounded-full bg-red-50 flex items-center justify-center"
-          >
-            <Trash2 size={14} className="text-red-500" />
-          </button>
+          {canEdit && (
+            <button
+              onClick={() => setConfirmDelete(true)}
+              className="w-8 h-8 rounded-full bg-red-50 flex items-center justify-center"
+            >
+              <Trash2 size={14} className="text-red-500" />
+            </button>
+          )}
           <button onClick={onClose} className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center">
             <X size={15} className="text-slate-500" />
           </button>
@@ -591,6 +614,59 @@ function EditTaskModal({ task, employees, onSave, onDelete, onClose }: {
             </button>
           </div>
         </div>
+      ) : mode === "view" ? (
+        <div className="overflow-y-auto flex-1 p-5 pb-6 space-y-5" style={{ scrollbarWidth: "none" }}>
+          <div>
+            <div className="flex items-center gap-2 mb-2">
+              <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full tracking-wide ${P_CFG[task.priority].bg} ${P_CFG[task.priority].text}`}>{P_CFG[task.priority].label}</span>
+              <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${S_CFG[task.status].bg} ${S_CFG[task.status].text}`}>{S_CFG[task.status].label}</span>
+            </div>
+            <p className={`font-bold text-lg leading-snug ${done ? "line-through text-slate-300" : "text-slate-800"}`}>{task.title}</p>
+            {task.description && <p className="text-sm text-slate-500 mt-1.5 leading-relaxed">{task.description}</p>}
+            <p className={`flex items-center gap-1 text-xs font-semibold mt-2 ${isOverdue(task.dueDate, task.status) ? "text-red-500" : "text-slate-400"}`}>
+              <Clock size={11} /> Due {relDate(task.dueDate)}
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Assigned To</label>
+            <div className="flex items-center gap-2 bg-slate-50 rounded-xl px-3 py-2.5">
+              {assignee ? (
+                <span className="w-6 h-6 rounded-full flex items-center justify-center text-white text-[10px] font-black" style={{ backgroundColor: assignee.color }}>
+                  {initials(assignee.name)}
+                </span>
+              ) : <Users size={14} className="text-slate-400" />}
+              <span className="text-sm font-semibold text-slate-700">{assignee ? assignee.name : "Unassigned"}</span>
+            </div>
+          </div>
+
+          {task.voiceNoteUrl && <VoiceNotePlayer url={task.voiceNoteUrl} />}
+
+          {task.imageUrls.length > 0 && (
+            <div>
+              <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">
+                Images {task.imageUrls.length > 1 && `(${task.imageUrls.length})`}
+              </label>
+              <div className="flex flex-wrap gap-2">
+                {task.imageUrls.map(url => (
+                  <button key={url} type="button" onClick={() => setLightboxUrl(url)}
+                    className="w-16 h-16 rounded-xl overflow-hidden flex-shrink-0"
+                  >
+                    <img src={url} alt="Task attachment" className="w-full h-full object-cover" />
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {canEdit && (
+            <button type="button" onClick={startEdit}
+              className="w-full py-3.5 rounded-2xl text-sm font-bold bg-indigo-50 text-indigo-600 flex items-center justify-center gap-2 hover:bg-indigo-100 transition-colors"
+            >
+              <Pencil size={14} /> Edit Task
+            </button>
+          )}
+        </div>
       ) : (
         <div className="overflow-y-auto flex-1 p-5 pb-6" style={{ scrollbarWidth: "none" }}>
           <TaskFormFields
@@ -604,14 +680,38 @@ function EditTaskModal({ task, employees, onSave, onDelete, onClose }: {
             imageUrls={imageUrls} setImageUrls={setImageUrls}
             employees={employees} showStatus={true}
           />
-          <button type="button" onClick={save} disabled={!title.trim()}
-            className="w-full mt-5 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"
-          >
-            Save Changes
-          </button>
+          <div className="flex gap-3 mt-5">
+            <button type="button" onClick={cancel}
+              className="flex-1 py-4 rounded-2xl text-sm font-bold bg-slate-100 text-slate-600 hover:bg-slate-200 transition-colors"
+            >
+              Cancel
+            </button>
+            <button type="button" onClick={save} disabled={!title.trim()}
+              className="flex-1 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"
+            >
+              Save Changes
+            </button>
+          </div>
         </div>
       )}
     </BottomSheet>
+
+    {lightboxUrl && (
+      <div
+        className="fixed inset-0 z-[70] bg-black/85 flex items-center justify-center p-6"
+        onClick={() => setLightboxUrl(null)}
+      >
+        <img src={lightboxUrl} alt="Task attachment" className="max-w-full max-h-full rounded-2xl object-contain" />
+        <button
+          type="button"
+          onClick={() => setLightboxUrl(null)}
+          className="absolute top-5 right-5 w-9 h-9 rounded-full bg-white/10 flex items-center justify-center"
+        >
+          <X size={18} className="text-white" />
+        </button>
+      </div>
+    )}
+    </>
   );
 }
 
@@ -1467,20 +1567,30 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
 }
 
 /* ─── EmployeeTaskModal (detail + comments + reassign) ────── */
-function EmployeeTaskModal({ task, employees, currentEmployeeId, onStatus, onReassign, onAddComment, onClose }: {
+function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStatus, onReassign, onAddComment, onSave, onClose }: {
   task: Task;
   employees: Employee[];
   currentEmployeeId: string;
+  canEdit: boolean;
   onStatus: (id: string, s: TaskStatus) => void;
   onReassign: (taskId: string, newAssigneeId: string) => void;
   onAddComment: (taskId: string, authorId: string, text: string, imageUrls?: string[]) => void;
+  onSave: (updated: Task) => void;
   onClose: () => void;
 }) {
+  const [mode, setMode] = useState<"view" | "edit">("view");
   const [commentText, setCommentText] = useState("");
   const [commentImages, setCommentImages] = useState<string[]>([]);
   const commentFileInput = useRef<HTMLInputElement | null>(null);
   const [reassignOpen, setReassignOpen] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [title, setTitle]           = useState(task.title);
+  const [desc, setDesc]             = useState(task.description);
+  const [assigneeId, setAssigneeId] = useState<string | null>(task.assigneeId);
+  const [priority, setPriority]     = useState<Priority>(task.priority);
+  const [dueDate, setDueDate]       = useState(task.dueDate);
+  const [voiceNoteUrl, setVoice]    = useState<string | null>(task.voiceNoteUrl);
+  const [imageUrls, setImageUrls]   = useState<string[]>(task.imageUrls);
   const assignee = employees.find(e => e.id === task.assigneeId);
   const done = task.status === "done";
   const peers = employees.filter(e => e.id !== task.assigneeId);
@@ -1492,16 +1602,62 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, onStatus, onRea
     setCommentImages([]);
   };
 
+  const startEdit = () => {
+    setTitle(task.title);
+    setDesc(task.description);
+    setAssigneeId(task.assigneeId);
+    setPriority(task.priority);
+    setDueDate(task.dueDate);
+    setVoice(task.voiceNoteUrl);
+    setImageUrls(task.imageUrls);
+    setMode("edit");
+  };
+
+  const cancelEdit = () => setMode("view");
+
+  const saveEdit = () => {
+    if (!title.trim()) return;
+    onSave({ ...task, title, description: desc, assigneeId, priority, dueDate, voiceNoteUrl, imageUrls });
+    setMode("view");
+  };
+
   return (
     <>
     <BottomSheet onClose={onClose}>
       <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100 flex-shrink-0">
-        <h2 className="text-base font-bold text-slate-800">Task Details</h2>
+        <h2 className="text-base font-bold text-slate-800">{mode === "edit" ? "Edit Task" : "Task Details"}</h2>
         <button onClick={onClose} className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center">
           <X size={15} className="text-slate-500" />
         </button>
       </div>
 
+      {mode === "edit" ? (
+        <div className="overflow-y-auto flex-1 p-5 pb-6" style={{ scrollbarWidth: "none" }}>
+          <TaskFormFields
+            title={title} setTitle={setTitle}
+            desc={desc} setDesc={setDesc}
+            priority={priority} setPriority={setPriority}
+            dueDate={dueDate} setDueDate={setDueDate}
+            assigneeId={assigneeId} setAssigneeId={setAssigneeId}
+            status={task.status} setStatus={() => {}}
+            voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
+            imageUrls={imageUrls} setImageUrls={setImageUrls}
+            employees={employees} showStatus={false}
+          />
+          <div className="flex gap-3 mt-5">
+            <button type="button" onClick={cancelEdit}
+              className="flex-1 py-4 rounded-2xl text-sm font-bold bg-slate-100 text-slate-600 hover:bg-slate-200 transition-colors"
+            >
+              Cancel
+            </button>
+            <button type="button" onClick={saveEdit} disabled={!title.trim()}
+              className="flex-1 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"
+            >
+              Save Changes
+            </button>
+          </div>
+        </div>
+      ) : (
       <div className="overflow-y-auto flex-1 p-5 pb-6 space-y-5" style={{ scrollbarWidth: "none" }}>
         <div>
           <div className="flex items-center gap-2 mb-2">
@@ -1514,6 +1670,14 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, onStatus, onRea
             <Clock size={11} /> Due {relDate(task.dueDate)}
           </p>
         </div>
+
+        {canEdit && (
+          <button type="button" onClick={startEdit}
+            className="w-full py-3.5 rounded-2xl text-sm font-bold bg-indigo-50 text-indigo-600 flex items-center justify-center gap-2 hover:bg-indigo-100 transition-colors"
+          >
+            <Pencil size={14} /> Edit Task
+          </button>
+        )}
 
         {/* Voice note */}
         {task.voiceNoteUrl && <VoiceNotePlayer url={task.voiceNoteUrl} />}
@@ -1652,6 +1816,7 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, onStatus, onRea
           </div>
         </div>
       </div>
+      )}
     </BottomSheet>
 
     {lightboxUrl && (
@@ -2032,26 +2197,35 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
           onClose={() => setShowAdd(false)}
         />
       )}
-      {editTask && role === "owner" && (
-        <EditTaskModal
-          task={editTask}
-          employees={employees}
-          onSave={handleSaveTask}
-          onDelete={id => { handleDeleteTask(id); setEditTask(null); }}
-          onClose={() => setEditTask(null)}
-        />
-      )}
-      {editTask && role === "employee" && (
-        <EmployeeTaskModal
-          task={tasks.find(t => t.id === editTask.id) ?? editTask}
-          employees={employees}
-          currentEmployeeId={currentEmployeeId}
-          onStatus={handleStatus}
-          onReassign={handleReassign}
-          onAddComment={handleAddComment}
-          onClose={() => setEditTask(null)}
-        />
-      )}
+      {editTask && role === "owner" && (() => {
+        const current = tasks.find(t => t.id === editTask.id) ?? editTask;
+        return (
+          <EditTaskModal
+            task={current}
+            employees={employees}
+            canEdit={role === "owner" || (current.createdById === currentEmployeeId && current.status === "todo")}
+            onSave={handleSaveTask}
+            onDelete={id => { handleDeleteTask(id); setEditTask(null); }}
+            onClose={() => setEditTask(null)}
+          />
+        );
+      })()}
+      {editTask && role === "employee" && (() => {
+        const current = tasks.find(t => t.id === editTask.id) ?? editTask;
+        return (
+          <EmployeeTaskModal
+            task={current}
+            employees={employees}
+            currentEmployeeId={currentEmployeeId}
+            canEdit={current.createdById === currentEmployeeId && current.status === "todo"}
+            onStatus={handleStatus}
+            onReassign={handleReassign}
+            onAddComment={handleAddComment}
+            onSave={handleSaveTask}
+            onClose={() => setEditTask(null)}
+          />
+        );
+      })()}
     </>
   );
 }
