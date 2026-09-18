@@ -246,14 +246,18 @@ create policy "task media delete for org members" on storage.objects
 -- task_event rather than being a status of its own.)
 -- ============================================
 
--- Map the old 3-state values onto their closest lifecycle equivalent
--- before the constraint changes. Safe to re-run — no rows match the old
--- values a second time.
+-- The old constraint (status in ('todo','in-progress','done')) must be
+-- dropped BEFORE the data is remapped below — otherwise the very first
+-- update (todo -> assigned) violates the old constraint, since it has
+-- no way to know 'assigned' is about to become valid.
+alter table tasks drop constraint if exists tasks_status_check;
+
+-- Map the old 3-state values onto their closest lifecycle equivalent.
+-- Safe to re-run — no rows match the old values a second time.
 update tasks set status = 'assigned'  where status = 'todo';
 update tasks set status = 'working'   where status = 'in-progress';
 update tasks set status = 'completed' where status = 'done';
 
-alter table tasks drop constraint if exists tasks_status_check;
 alter table tasks add constraint tasks_status_check
   check (status in ('draft','assigned','accepted','working','completed','closed'));
 alter table tasks alter column status set default 'draft';
