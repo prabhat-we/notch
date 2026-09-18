@@ -3,7 +3,7 @@ import {
   LayoutDashboard, ListTodo, Settings, Plus, Mic, Play, Pause,
   Clock, Users, Check, X, Volume2, StopCircle,
   Trash2, Bell, TrendingUp, ChevronRight, ChevronLeft,
-  Shield, Pencil, Image as ImageIcon, LogOut, Send, Loader2
+  Shield, Pencil, Image as ImageIcon, LogOut, Send, Loader2, Zap
 } from "lucide-react";
 import { useAuth } from "./auth/AuthContext";
 import AuthScreen from "./auth/AuthScreen";
@@ -16,7 +16,11 @@ import { uploadTaskMedia, resolveSignedUrl } from "../lib/storage";
 
 
 /* ─── Types ───────────────────────────────────────────────── */
-type TaskStatus = "todo" | "in-progress" | "done";
+// Lifecycle: draft -> assigned -> accepted -> working -> completed -> closed.
+// completed -> assigned is a reopen/reassign, logged as a "reassigned"
+// task_event rather than being a status of its own.
+type TaskStatus = "draft" | "assigned" | "accepted" | "working" | "completed" | "closed";
+type TaskEventType = "status_change" | "reassigned";
 type Priority = "low" | "medium" | "high";
 type View = "dashboard" | "tasks" | "settings";
 type AppRole = "owner" | "employee";
@@ -61,10 +65,22 @@ const P_CFG: Record<Priority, { label: string; text: string; bg: string; strip: 
   low:    { label: "Low",    text: "text-slate-500", bg: "bg-slate-100", strip: "bg-slate-400" },
 };
 const S_CFG: Record<TaskStatus, { label: string; text: string; bg: string }> = {
-  "todo":        { label: "To Do",       text: "text-slate-600",   bg: "bg-slate-100"  },
-  "in-progress": { label: "In Progress", text: "text-indigo-600",  bg: "bg-indigo-50"  },
-  "done":        { label: "Done",        text: "text-emerald-600", bg: "bg-emerald-50" },
+  draft:     { label: "Draft",       text: "text-slate-500",   bg: "bg-slate-100"  },
+  assigned:  { label: "Assigned",    text: "text-amber-600",   bg: "bg-amber-50"   },
+  accepted:  { label: "Accepted",    text: "text-sky-600",     bg: "bg-sky-50"     },
+  working:   { label: "In Progress", text: "text-indigo-600",  bg: "bg-indigo-50"  },
+  completed: { label: "Completed",   text: "text-emerald-600", bg: "bg-emerald-50" },
+  closed:    { label: "Closed",      text: "text-slate-500",   bg: "bg-slate-200"  },
 };
+// A task is no longer "active" once it's completed or closed — used
+// everywhere the old model checked `status === "done"`.
+const isFinished = (s: TaskStatus) => s === "completed" || s === "closed";
+// Collapses the 6-state lifecycle onto the 3 buckets used by list
+// filters, dashboard stats, and sort ordering (unchanged from before —
+// only the states feeding each bucket changed): To Do = draft/assigned,
+// In Progress = accepted/working, Done = completed/closed.
+const isInProgress = (s: TaskStatus) => s === "accepted" || s === "working";
+const isNotYetStarted = (s: TaskStatus) => s === "draft" || s === "assigned";
 const AVATAR_COLORS = ["#7C3AED","#0891B2","#059669","#DC2626","#D97706","#4F46E5","#DB2777"];
 
 /* ─── Helpers ─────────────────────────────────────────────── */
@@ -76,7 +92,7 @@ function relDate(d: string) {
   if (diff < 0) return `${Math.abs(diff)}d overdue`;
   return `${diff}d left`;
 }
-const isOverdue = (d: string, s: TaskStatus) => new Date(d) < getToday() && s !== "done";
+const isOverdue = (d: string, s: TaskStatus) => new Date(d) < getToday() && !isFinished(s);
 const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
 // Deterministic avatar color from a membership id — there's no color-picker UI
@@ -498,8 +514,8 @@ function VoiceNotePlayer({ path }: { path: string }) {
 /* ─── TaskFormFields (shared by Add + Edit) ───────────────── */
 function TaskFormFields({
   title, setTitle, desc, setDesc, priority, setPriority,
-  dueDate, setDueDate, assigneeId, setAssigneeId, status, setStatus,
-  voiceNoteUrl, setVoice, imageUrls, setImageUrls, employees, showStatus,
+  dueDate, setDueDate, assigneeId, setAssigneeId,
+  voiceNoteUrl, setVoice, imageUrls, setImageUrls, employees, requireTitle,
   orgId, taskId, onUploadingChange,
 }: {
   title: string; setTitle: (v: string) => void;
@@ -507,14 +523,16 @@ function TaskFormFields({
   priority: Priority; setPriority: (v: Priority) => void;
   dueDate: string; setDueDate: (v: string) => void;
   assigneeId: string | null; setAssigneeId: (v: string | null) => void;
-  status: TaskStatus; setStatus: (v: TaskStatus) => void;
   voiceNoteUrl: string | null; setVoice: (v: string | null) => void;
   imageUrls: string[]; setImageUrls: (v: string[]) => void;
-  employees: Employee[]; showStatus: boolean;
+  employees: Employee[];
+  // Status is no longer freely editable here — it's exclusively driven by
+  // the guarded lifecycle transition buttons in the read-only view.
+  requireTitle: boolean;
   orgId: string; taskId: string;
   onUploadingChange?: (uploading: boolean) => void;
 }) {
-  const titleOptional = !showStatus && !title.trim() && (!!voiceNoteUrl || imageUrls.length > 0);
+  const titleOptional = !requireTitle && !title.trim() && (!!voiceNoteUrl || imageUrls.length > 0);
   const [voiceUploading, setVoiceUploading] = useState(false);
   const [imagesUploading, setImagesUploading] = useState(false);
   useEffect(() => { onUploadingChange?.(voiceUploading || imagesUploading); }, [voiceUploading, imagesUploading, onUploadingChange]);
@@ -552,23 +570,6 @@ function TaskFormFields({
           ))}
         </div>
       </div>
-
-      {showStatus && (
-        <div>
-          <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Status</label>
-          <div className="flex gap-2">
-            {(["todo", "in-progress", "done"] as TaskStatus[]).map(s => (
-              <button key={s} type="button" onClick={() => setStatus(s)}
-                className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all ${
-                  status === s ? `${S_CFG[s].bg} ${S_CFG[s].text} ring-2 ring-current ring-offset-1` : "bg-slate-100 text-slate-400"
-                }`}
-              >
-                {S_CFG[s].label}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
 
       <div>
         <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Due Date</label>
@@ -631,7 +632,6 @@ function AddTaskModal({ employees, orgId, defaultAssigneeId, assignLabel, onAdd,
   const [assigneeId, setAssigneeId] = useState<string | null>(defaultAssigneeId ?? null);
   const [priority, setPriority]     = useState<Priority>("medium");
   const [dueDate, setDueDate]       = useState(() => addDays(getToday(), 3).toISOString().slice(0, 10));
-  const [status, setStatus]         = useState<TaskStatus>("todo");
   const [voiceNoteUrl, setVoice]    = useState<string | null>(null);
   const [imageUrls, setImageUrls]   = useState<string[]>([]);
   const [mediaUploading, setMediaUploading] = useState(false);
@@ -641,7 +641,7 @@ function AddTaskModal({ employees, orgId, defaultAssigneeId, assignLabel, onAdd,
   const submit = () => {
     if (!hasContent || mediaUploading) return;
     const finalTitle = title.trim() || (voiceNoteUrl ? "Voice note task" : "Image task");
-    onAdd({ id: taskId, title: finalTitle, description: desc, assigneeId, createdById: defaultAssigneeId ?? null, status, priority, dueDate, voiceNoteUrl, imageUrls });
+    onAdd({ id: taskId, title: finalTitle, description: desc, assigneeId, createdById: defaultAssigneeId ?? null, priority, dueDate, voiceNoteUrl, imageUrls });
     onClose();
   };
 
@@ -665,10 +665,9 @@ function AddTaskModal({ employees, orgId, defaultAssigneeId, assignLabel, onAdd,
           priority={priority} setPriority={setPriority}
           dueDate={dueDate} setDueDate={setDueDate}
           assigneeId={assigneeId} setAssigneeId={setAssigneeId}
-          status={status} setStatus={setStatus}
           voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
           imageUrls={imageUrls} setImageUrls={setImageUrls}
-          employees={employees} showStatus={false}
+          employees={employees} requireTitle={false}
           orgId={orgId} taskId={taskId} onUploadingChange={setMediaUploading}
         />
         <button type="button" onClick={submit} disabled={!hasContent || mediaUploading}
@@ -682,13 +681,15 @@ function AddTaskModal({ employees, orgId, defaultAssigneeId, assignLabel, onAdd,
 }
 
 /* ─── EditTaskModal ───────────────────────────────────────── */
-function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onClose }: {
+function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onCloseTask, onReopen, onClose }: {
   task: Task;
   employees: Employee[];
   orgId: string;
   canEdit: boolean;
   onSave: (updated: Task) => void;
   onDelete: (id: string) => void;
+  onCloseTask: (id: string) => void;
+  onReopen: (id: string, newAssigneeId: string | null) => void;
   onClose: () => void;
 }) {
   const [mode, setMode]             = useState<"view" | "edit">("view");
@@ -697,15 +698,15 @@ function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onCl
   const [assigneeId, setAssigneeId] = useState<string | null>(task.assigneeId);
   const [priority, setPriority]     = useState<Priority>(task.priority);
   const [dueDate, setDueDate]       = useState(task.dueDate);
-  const [status, setStatus]         = useState<TaskStatus>(task.status);
   const [voiceNoteUrl, setVoice]    = useState<string | null>(task.voiceNoteUrl);
   const [imageUrls, setImageUrls]   = useState<string[]>(task.imageUrls);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [mediaUploading, setMediaUploading] = useState(false);
+  const [reopenPickerOpen, setReopenPickerOpen] = useState(false);
 
   const assignee = employees.find(e => e.id === task.assigneeId);
-  const done = task.status === "done";
+  const done = isFinished(task.status);
 
   const startEdit = () => {
     setTitle(task.title);
@@ -713,7 +714,6 @@ function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onCl
     setAssigneeId(task.assigneeId);
     setPriority(task.priority);
     setDueDate(task.dueDate);
-    setStatus(task.status);
     setVoice(task.voiceNoteUrl);
     setImageUrls(task.imageUrls);
     setMode("edit");
@@ -723,7 +723,7 @@ function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onCl
 
   const save = () => {
     if (!title.trim() || mediaUploading) return;
-    onSave({ ...task, title, description: desc, assigneeId, priority, dueDate, status, voiceNoteUrl, imageUrls });
+    onSave({ ...task, title, description: desc, assigneeId, priority, dueDate, voiceNoteUrl, imageUrls });
     setMode("view");
   };
 
@@ -821,6 +821,42 @@ function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onCl
             </div>
           )}
 
+          {task.status === "completed" && (
+            <div className="space-y-2">
+              <button type="button" onClick={() => onCloseTask(task.id)}
+                className="w-full py-3.5 rounded-2xl text-sm font-bold bg-slate-800 text-white flex items-center justify-center gap-2 hover:bg-slate-900 transition-colors"
+              >
+                Close
+              </button>
+              <button type="button" onClick={() => setReopenPickerOpen(o => !o)}
+                className="w-full py-3.5 rounded-2xl text-sm font-bold bg-amber-50 text-amber-700 flex items-center justify-center gap-2 hover:bg-amber-100 transition-colors"
+              >
+                {reopenPickerOpen ? "Cancel" : "Reopen"}
+              </button>
+              {reopenPickerOpen && (
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button type="button"
+                    onClick={() => { onReopen(task.id, task.assigneeId); setReopenPickerOpen(false); }}
+                    className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-100 text-slate-600 hover:bg-indigo-50 hover:text-indigo-700 transition-colors"
+                  >
+                    Keep {assignee ? assignee.name.split(" ")[0] : "unassigned"}
+                  </button>
+                  {employees.filter(e => e.id !== task.assigneeId).map(emp => (
+                    <button key={emp.id} type="button"
+                      onClick={() => { onReopen(task.id, emp.id); setReopenPickerOpen(false); }}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-100 text-slate-600 hover:bg-indigo-50 hover:text-indigo-700 transition-colors"
+                    >
+                      <span className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[10px] font-black" style={{ backgroundColor: emp.color }}>
+                        {initials(emp.name)}
+                      </span>
+                      {emp.name.split(" ")[0]}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {canEdit && (
             <button type="button" onClick={startEdit}
               className="w-full py-3.5 rounded-2xl text-sm font-bold bg-indigo-50 text-indigo-600 flex items-center justify-center gap-2 hover:bg-indigo-100 transition-colors"
@@ -837,10 +873,9 @@ function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onCl
             priority={priority} setPriority={setPriority}
             dueDate={dueDate} setDueDate={setDueDate}
             assigneeId={assigneeId} setAssigneeId={setAssigneeId}
-            status={status} setStatus={setStatus}
             voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
             imageUrls={imageUrls} setImageUrls={setImageUrls}
-            employees={employees} showStatus={true}
+            employees={employees} requireTitle={true}
             orgId={orgId} taskId={task.id} onUploadingChange={setMediaUploading}
           />
           <div className="flex gap-3 mt-5">
@@ -880,11 +915,10 @@ function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onCl
 
 /* ─── SwipeableTaskCard ───────────────────────────────────── */
 function SwipeCard({
-  task, employees, onStatus, onDelete, onEdit, onVoicePlay
+  task, employees, onDelete, onEdit, onVoicePlay
 }: {
   task: Task;
   employees: Employee[];
-  onStatus: (id: string, s: TaskStatus) => void;
   onDelete: (id: string) => void;
   onEdit: (task: Task) => void;
   onVoicePlay?: (url: string) => void;
@@ -898,8 +932,6 @@ function SwipeCard({
   const assignee = employees.find(e => e.id === task.assigneeId);
   const p = P_CFG[task.priority];
   const s = S_CFG[task.status];
-  const next: Record<TaskStatus, TaskStatus> = { "todo":"in-progress", "in-progress":"done", "done":"done" };
-  const advanceLabel = task.status === "todo" ? "Start" : task.status === "in-progress" ? "Complete" : "Done!";
 
   const onDown = (e: React.PointerEvent) => {
     dragging.current = true;
@@ -911,14 +943,14 @@ function SwipeCard({
     if (!dragging.current) return;
     const delta = e.clientX - startX.current;
     totalMove.current = Math.abs(delta);
-    setSwipeX(Math.max(-110, Math.min(110, delta)));
+    // Status transitions now happen only via the guarded action buttons in
+    // the task detail view — swipe here is delete-only.
+    setSwipeX(Math.max(-110, Math.min(0, delta)));
   };
   const onUp = () => {
     if (totalMove.current < 8) {
-      // tap — open edit
+      // tap — open detail
       onEdit(task);
-    } else if (swipeX > THRESH) {
-      onStatus(task.id, next[task.status]);
     } else if (swipeX < -THRESH) {
       onDelete(task.id);
     }
@@ -926,15 +958,10 @@ function SwipeCard({
     dragging.current = false;
   };
 
-  const showRight = swipeX > 18;
   const showLeft  = swipeX < -18;
 
   return (
     <div className="relative mb-3 rounded-2xl overflow-hidden" style={{ minHeight: 96 }}>
-      <div className={`absolute inset-0 flex items-center pl-5 bg-emerald-500 rounded-2xl transition-opacity duration-100 ${showRight ? "opacity-100" : "opacity-0"}`}>
-        <Check size={18} className="text-white" strokeWidth={3} />
-        <span className="text-white text-sm font-bold ml-2">{advanceLabel}</span>
-      </div>
       <div className={`absolute inset-0 flex items-center justify-end pr-5 bg-red-400 rounded-2xl transition-opacity duration-100 ${showLeft ? "opacity-100" : "opacity-0"}`}>
         <span className="text-white text-sm font-bold mr-2">Delete</span>
         <Trash2 size={18} className="text-white" />
@@ -968,7 +995,7 @@ function SwipeCard({
                   </button>
                 )}
               </div>
-              <p className={`font-bold text-[13px] leading-snug ${task.status === "done" ? "line-through text-slate-300" : "text-slate-800"}`}>
+              <p className={`font-bold text-[13px] leading-snug ${isFinished(task.status) ? "line-through text-slate-300" : "text-slate-800"}`}>
                 {task.title}
               </p>
               <p className="text-[11px] text-slate-400 mt-0.5 line-clamp-1 leading-relaxed">{task.description}</p>
@@ -1003,7 +1030,7 @@ function SwipeCard({
 
           <div className="flex items-center justify-between mt-3">
             <span className={`flex items-center gap-1.5 text-[11px] font-bold px-2.5 py-1 rounded-full ${s.bg} ${s.text}`}>
-              {task.status === "done" ? <Check size={11} strokeWidth={3} /> : task.status === "in-progress" ? <TrendingUp size={11} /> : <Clock size={11} />}
+              {isFinished(task.status) ? <Check size={11} strokeWidth={3} /> : (task.status === "accepted" || task.status === "working") ? <TrendingUp size={11} /> : <Clock size={11} />}
               {s.label}
             </span>
             <span className={`flex items-center gap-1 text-[11px] font-semibold ${isOverdue(task.dueDate, task.status) ? "text-red-500" : "text-slate-400"}`}>
@@ -1022,13 +1049,13 @@ function DashboardView({ tasks, employees, userName, onView, onSelectMember, onO
   onSelectMember: (id: string) => void; onOpenTask: (task: Task) => void;
 }) {
   const counts = {
-    inProgress: tasks.filter(t => t.status === "in-progress").length,
-    done:       tasks.filter(t => t.status === "done").length,
+    inProgress: tasks.filter(t => isInProgress(t.status)).length,
+    done:       tasks.filter(t => isFinished(t.status)).length,
     overdue:    tasks.filter(t => isOverdue(t.dueDate, t.status)).length,
-    todo:       tasks.filter(t => t.status === "todo").length,
+    todo:       tasks.filter(t => isNotYetStarted(t.status)).length,
     total:      tasks.length,
   };
-  const activeTasks = tasks.filter(t => t.status !== "done").slice(0, 4);
+  const activeTasks = tasks.filter(t => !isFinished(t.status)).slice(0, 4);
 
   return (
     <div className="p-5">
@@ -1069,7 +1096,7 @@ function DashboardView({ tasks, employees, userName, onView, onSelectMember, onO
         <div className="space-y-2">
           {employees.map(emp => {
             const empTasks = tasks.filter(t => t.assigneeId === emp.id);
-            const done = empTasks.filter(t => t.status === "done").length;
+            const done = empTasks.filter(t => isFinished(t.status)).length;
             const pct = empTasks.length ? (done / empTasks.length) * 100 : 0;
             return (
               <button key={emp.id} type="button" onClick={() => onSelectMember(emp.id)}
@@ -1155,10 +1182,10 @@ function TeamMemberPage({ employee, tasks, onBack, onOpenTask }: {
 }) {
   const empTasks = tasks.filter(t => t.assigneeId === employee.id)
     .slice()
-    .sort((a, b) => a.status === "done" && b.status !== "done" ? 1 : a.status !== "done" && b.status === "done" ? -1 : 0);
-  const done       = empTasks.filter(t => t.status === "done").length;
-  const inProgress = empTasks.filter(t => t.status === "in-progress").length;
-  const todo       = empTasks.filter(t => t.status === "todo").length;
+    .sort((a, b) => isFinished(a.status) && !isFinished(b.status) ? 1 : !isFinished(a.status) && isFinished(b.status) ? -1 : 0);
+  const done       = empTasks.filter(t => isFinished(t.status)).length;
+  const inProgress = empTasks.filter(t => isInProgress(t.status)).length;
+  const todo       = empTasks.filter(t => isNotYetStarted(t.status)).length;
   const overdue    = empTasks.filter(t => isOverdue(t.dueDate, t.status)).length;
   const pct = empTasks.length ? (done / empTasks.length) * 100 : 0;
 
@@ -1229,7 +1256,7 @@ function TeamMemberPage({ employee, tasks, onBack, onOpenTask }: {
                   >
                     <div className={`w-1 h-9 rounded-full flex-shrink-0 ${p.strip}`} />
                     <div className="flex-1 min-w-0">
-                      <p className={`text-sm font-bold truncate ${task.status === "done" ? "line-through text-slate-300" : "text-slate-800"}`}>{task.title}</p>
+                      <p className={`text-sm font-bold truncate ${isFinished(task.status) ? "line-through text-slate-300" : "text-slate-800"}`}>{task.title}</p>
                       <div className="flex items-center gap-2 mt-0.5">
                         <span className={`text-[11px] font-semibold ${s.text}`}>{s.label}</span>
                         <span className="text-slate-200">·</span>
@@ -1249,25 +1276,30 @@ function TeamMemberPage({ employee, tasks, onBack, onOpenTask }: {
 }
 
 /* ─── TasksView ───────────────────────────────────────────── */
-function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
+type TaskBucket = "all" | "todo" | "active" | "done";
+// Collapses the 6-state lifecycle onto the 3 filter tabs this view has
+// always had — same bucketing as the dashboard stats.
+const inBucket = (t: Task, b: TaskBucket) =>
+  b === "all" ? true : b === "todo" ? isNotYetStarted(t.status) : b === "active" ? isInProgress(t.status) : isFinished(t.status);
+
+function TasksView({ tasks, employees, loading, onDelete, onEdit }: {
   tasks: Task[];
   employees: Employee[];
   loading: boolean;
-  onStatus: (id: string, s: TaskStatus) => void;
   onDelete: (id: string) => void;
   onEdit: (task: Task) => void;
 }) {
-  const [filter, setFilter] = useState<TaskStatus | "all">("all");
+  const [filter, setFilter] = useState<TaskBucket>("all");
   const audioEl = useRef<HTMLAudioElement | null>(null);
   const [playingUrl, setPlayingUrl] = useState<string | null>(null);
 
-  const filtered = filter === "all" ? tasks : tasks.filter(t => t.status === filter);
-  const activeFiltered = filtered.filter(t => t.status !== "done");
-  const doneFiltered = filtered.filter(t => t.status === "done");
-  const tabs: { id: TaskStatus | "all"; label: string }[] = [
+  const filtered = tasks.filter(t => inBucket(t, filter));
+  const activeFiltered = filtered.filter(t => !isFinished(t.status));
+  const doneFiltered = filtered.filter(t => isFinished(t.status));
+  const tabs: { id: TaskBucket; label: string }[] = [
     { id: "all", label: "All" },
     { id: "todo", label: "To Do" },
-    { id: "in-progress", label: "Active" },
+    { id: "active", label: "Active" },
     { id: "done", label: "Done" },
   ];
 
@@ -1287,12 +1319,12 @@ function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
     <div className="p-5">
       <div className="mb-4">
         <h1 className="text-xl font-black text-slate-800">Tasks</h1>
-        <p className="text-[11px] text-slate-400 mt-0.5 font-medium">Tap to edit · Swipe right to advance · left to delete</p>
+        <p className="text-[11px] text-slate-400 mt-0.5 font-medium">Tap to view · Swipe left to delete</p>
       </div>
 
       <div className="flex gap-2 mb-5 overflow-x-auto pb-1" style={{ scrollbarWidth: "none" }}>
         {tabs.map(tab => {
-          const cnt = tab.id === "all" ? tasks.length : tasks.filter(t => t.status === tab.id).length;
+          const cnt = tasks.filter(t => inBucket(t, tab.id)).length;
           return (
             <button key={tab.id} onClick={() => setFilter(tab.id)}
               className={`flex-shrink-0 flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold transition-all ${
@@ -1325,7 +1357,6 @@ function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
               key={task.id}
               task={task}
               employees={employees}
-              onStatus={onStatus}
               onDelete={onDelete}
               onEdit={onEdit}
               onVoicePlay={handleVoicePlay}
@@ -1339,7 +1370,6 @@ function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
               key={task.id}
               task={task}
               employees={employees}
-              onStatus={onStatus}
               onDelete={onDelete}
               onEdit={onEdit}
               onVoicePlay={handleVoicePlay}
@@ -1407,12 +1437,14 @@ function InviteEmployeeCard({ orgId, onInvited }: { orgId: string; onInvited: ()
 }
 
 /* ─── SettingsView ────────────────────────────────────────── */
-function SettingsView({ tasks, employees, employeesLoading, ownerName, orgId, onInvited, onSignOut }: {
+function SettingsView({ tasks, employees, employeesLoading, ownerName, orgId, autoAssign, onAutoAssignChange, onInvited, onSignOut }: {
   tasks: Task[];
   employees: Employee[];
   employeesLoading: boolean;
   ownerName: string;
   orgId: string;
+  autoAssign: boolean;
+  onAutoAssignChange: (v: boolean) => void;
   onInvited: () => void;
   onSignOut: () => void;
 }) {
@@ -1445,6 +1477,8 @@ function SettingsView({ tasks, employees, employeesLoading, ownerName, orgId, on
         {[
           { label: "Task Notifications", sub: "Alert employees on assignment", val: notifs, set: setNotifs, icon: Bell },
           { label: "Voice Instructions", sub: "Record audio notes for tasks",  val: voiceRec, set: setVoiceRec, icon: Mic },
+          { label: "Auto Assign", sub: "Skip manual accept — tasks go straight to Accepted",
+            val: autoAssign, set: (fn: (v: boolean) => boolean) => onAutoAssignChange(fn(autoAssign)), icon: Zap },
         ].map((item, i) => (
           <div key={i} className="flex items-center gap-3 px-4 py-4">
             <div className="w-9 h-9 rounded-xl bg-indigo-50 flex items-center justify-center flex-shrink-0">
@@ -1473,7 +1507,7 @@ function SettingsView({ tasks, employees, employeesLoading, ownerName, orgId, on
         <div className="space-y-2">
           {employees.map(emp => {
             const empTasks = tasks.filter(t => t.assigneeId === emp.id);
-            const active = empTasks.filter(t => t.status !== "done").length;
+            const active = empTasks.filter(t => !isFinished(t.status)).length;
             return (
               <div key={emp.id} className="bg-white rounded-2xl p-4 shadow-[0_1px_6px_rgba(15,23,42,0.06)] flex items-center gap-3">
                 <div className="w-10 h-10 rounded-full flex items-center justify-center text-white text-sm font-black flex-shrink-0" style={{ backgroundColor: emp.color }}>
@@ -1539,7 +1573,7 @@ function SettingsView({ tasks, employees, employeesLoading, ownerName, orgId, on
 
 /* ─── EmployeeTaskCard ────────────────────────────────────── */
 function EmployeeTaskCard({
-  task, employees, isSelf, sortMode, canMoveUp, canMoveDown, onStatus, onOpen, onMove,
+  task, employees, isSelf, sortMode, canMoveUp, canMoveDown, onOpen, onMove,
 }: {
   task: Task;
   employees: Employee[];
@@ -1547,13 +1581,12 @@ function EmployeeTaskCard({
   sortMode: SortMode;
   canMoveUp: boolean;
   canMoveDown: boolean;
-  onStatus: (id: string, s: TaskStatus) => void;
   onOpen: (task: Task) => void;
   onMove: (id: string, dir: -1 | 1) => void;
 }) {
   const assignee = employees.find(e => e.id === task.assigneeId);
   const p = P_CFG[task.priority];
-  const done = task.status === "done";
+  const done = isFinished(task.status);
 
   return (
     <div className="flex items-stretch gap-2 mb-2.5">
@@ -1576,15 +1609,13 @@ function EmployeeTaskCard({
       >
         <div className={`absolute left-0 top-0 bottom-0 w-[3px] rounded-l-2xl ${p.strip}`} />
         <div className="flex items-start gap-3">
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); onStatus(task.id, done ? "todo" : "done"); }}
-            className={`w-6 h-6 rounded-full border-2 flex items-center justify-center flex-shrink-0 mt-0.5 transition-all ${
+          <div
+            className={`w-6 h-6 rounded-full border-2 flex items-center justify-center flex-shrink-0 mt-0.5 ${
               done ? "bg-emerald-500 border-emerald-500" : "border-slate-300"
             }`}
           >
             {done && <Check size={13} className="text-white" strokeWidth={3} />}
-          </button>
+          </div>
 
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-1 flex-wrap">
@@ -1614,12 +1645,11 @@ function EmployeeTaskCard({
 }
 
 /* ─── EmployeeTasksView ───────────────────────────────────── */
-function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onStatus, onReorder, onOpenTask }: {
+function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onReorder, onOpenTask }: {
   tasks: Task[];
   employees: Employee[];
   currentEmployeeId: string;
   loading: boolean;
-  onStatus: (id: string, s: TaskStatus) => void;
   onReorder: (assigneeId: string | null, orderedIds: string[]) => void;
   onOpenTask: (task: Task) => void;
 }) {
@@ -1629,14 +1659,14 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
 
   const priorityRank: Record<Priority, number> = { high: 0, medium: 1, low: 2 };
   const sorted = [...myTasks].sort((a, b) => {
-    if (a.status === "done" && b.status !== "done") return 1;
-    if (b.status === "done" && a.status !== "done") return -1;
+    if (isFinished(a.status) && !isFinished(b.status)) return 1;
+    if (isFinished(b.status) && !isFinished(a.status)) return -1;
     if (sortMode === "priority") return priorityRank[a.priority] - priorityRank[b.priority];
     if (sortMode === "dueDate") return a.dueDate.localeCompare(b.dueDate);
     return a.order - b.order; // custom
   });
-  const activeSorted = sorted.filter(t => t.status !== "done");
-  const doneSorted = sorted.filter(t => t.status === "done");
+  const activeSorted = sorted.filter(t => !isFinished(t.status));
+  const doneSorted = sorted.filter(t => isFinished(t.status));
 
   const move = (id: string, dir: -1 | 1) => {
     const ids = sorted.map(t => t.id);
@@ -1699,7 +1729,6 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
                 sortMode={sortMode}
                 canMoveUp={i > 0}
                 canMoveDown={i < sorted.length - 1}
-                onStatus={onStatus}
                 onOpen={onOpenTask}
                 onMove={move}
               />
@@ -1719,7 +1748,6 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
                 sortMode={sortMode}
                 canMoveUp={i > 0}
                 canMoveDown={i < sorted.length - 1}
-                onStatus={onStatus}
                 onOpen={onOpenTask}
                 onMove={move}
               />
@@ -1732,13 +1760,16 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
 }
 
 /* ─── EmployeeTaskModal (detail + comments + reassign) ────── */
-function EmployeeTaskModal({ task, employees, orgId, currentEmployeeId, canEdit, onStatus, onReassign, onAddComment, onSave, onClose }: {
+function EmployeeTaskModal({ task, employees, orgId, currentEmployeeId, canEdit, onAccept, onStart, onComplete, onReopen, onReassign, onAddComment, onSave, onClose }: {
   task: Task;
   employees: Employee[];
   orgId: string;
   currentEmployeeId: string;
   canEdit: boolean;
-  onStatus: (id: string, s: TaskStatus) => void;
+  onAccept: (id: string) => void;
+  onStart: (id: string) => void;
+  onComplete: (id: string) => void;
+  onReopen: (id: string, newAssigneeId: string | null) => void;
   onReassign: (taskId: string, newAssigneeId: string) => void;
   onAddComment: (taskId: string, authorId: string, text: string, imageUrls?: string[]) => void;
   onSave: (updated: Task) => void;
@@ -1749,6 +1780,7 @@ function EmployeeTaskModal({ task, employees, orgId, currentEmployeeId, canEdit,
   const [commentImages, setCommentImages] = useState<string[]>([]);
   const commentFileInput = useRef<HTMLInputElement | null>(null);
   const [reassignOpen, setReassignOpen] = useState(false);
+  const [reopenPickerOpen, setReopenPickerOpen] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [title, setTitle]           = useState(task.title);
   const [desc, setDesc]             = useState(task.description);
@@ -1759,8 +1791,10 @@ function EmployeeTaskModal({ task, employees, orgId, currentEmployeeId, canEdit,
   const [imageUrls, setImageUrls]   = useState<string[]>(task.imageUrls);
   const [mediaUploading, setMediaUploading] = useState(false);
   const assignee = employees.find(e => e.id === task.assigneeId);
-  const done = task.status === "done";
+  const done = isFinished(task.status);
   const peers = employees.filter(e => e.id !== task.assigneeId);
+  const isAssignee = currentEmployeeId === task.assigneeId;
+  const isCreator = currentEmployeeId === task.createdById;
 
   const submitComment = () => {
     if (!commentText.trim() && commentImages.length === 0) return;
@@ -1806,10 +1840,9 @@ function EmployeeTaskModal({ task, employees, orgId, currentEmployeeId, canEdit,
             priority={priority} setPriority={setPriority}
             dueDate={dueDate} setDueDate={setDueDate}
             assigneeId={assigneeId} setAssigneeId={setAssigneeId}
-            status={task.status} setStatus={() => {}}
             voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
             imageUrls={imageUrls} setImageUrls={setImageUrls}
-            employees={employees} showStatus={false}
+            employees={employees} requireTitle={false}
             orgId={orgId} taskId={task.id} onUploadingChange={setMediaUploading}
           />
           <div className="flex gap-3 mt-5">
@@ -1868,17 +1901,60 @@ function EmployeeTaskModal({ task, employees, orgId, currentEmployeeId, canEdit,
           </div>
         )}
 
-        {/* Mark complete */}
-        <button
-          type="button"
-          onClick={() => onStatus(task.id, done ? "in-progress" : "done")}
-          className={`w-full py-3.5 rounded-2xl text-sm font-bold transition-colors flex items-center justify-center gap-2 ${
-            done ? "bg-slate-100 text-slate-500" : "bg-emerald-500 text-white shadow-lg shadow-emerald-500/20"
-          }`}
-        >
-          <Check size={15} strokeWidth={3} />
-          {done ? "Mark as not done" : "Mark as done"}
-        </button>
+        {/* Lifecycle action — only ever the one next step for this viewer */}
+        {isAssignee && task.status === "assigned" && (
+          <button type="button" onClick={() => onAccept(task.id)}
+            className="w-full py-3.5 rounded-2xl text-sm font-bold bg-indigo-600 text-white shadow-lg shadow-indigo-600/20 hover:bg-indigo-700 transition-colors"
+          >
+            why notch
+          </button>
+        )}
+        {isAssignee && task.status === "accepted" && (
+          <button type="button" onClick={() => onStart(task.id)}
+            className="w-full py-3.5 rounded-2xl text-sm font-bold bg-indigo-600 text-white shadow-lg shadow-indigo-600/20 hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2"
+          >
+            <TrendingUp size={15} /> Start
+          </button>
+        )}
+        {isAssignee && task.status === "working" && (
+          <button type="button" onClick={() => onComplete(task.id)}
+            className="w-full py-3.5 rounded-2xl text-sm font-bold bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 hover:bg-emerald-600 transition-colors flex items-center justify-center gap-2"
+          >
+            <Check size={15} strokeWidth={3} /> Mark complete
+          </button>
+        )}
+
+        {/* Reopen — creator (non-admin owners see this in EditTaskModal instead) */}
+        {isCreator && task.status === "completed" && (
+          <div className="space-y-2">
+            <button type="button" onClick={() => setReopenPickerOpen(o => !o)}
+              className="w-full py-3.5 rounded-2xl text-sm font-bold bg-amber-50 text-amber-700 flex items-center justify-center gap-2 hover:bg-amber-100 transition-colors"
+            >
+              {reopenPickerOpen ? "Cancel" : "Reopen"}
+            </button>
+            {reopenPickerOpen && (
+              <div className="flex flex-wrap gap-2">
+                <button type="button"
+                  onClick={() => { onReopen(task.id, task.assigneeId); setReopenPickerOpen(false); }}
+                  className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-100 text-slate-600 hover:bg-indigo-50 hover:text-indigo-700 transition-colors"
+                >
+                  Keep {assignee ? assignee.name.split(" ")[0] : "unassigned"}
+                </button>
+                {employees.filter(e => e.id !== task.assigneeId).map(emp => (
+                  <button key={emp.id} type="button"
+                    onClick={() => { onReopen(task.id, emp.id); setReopenPickerOpen(false); }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-100 text-slate-600 hover:bg-indigo-50 hover:text-indigo-700 transition-colors"
+                  >
+                    <span className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[10px] font-black" style={{ backgroundColor: emp.color }}>
+                      {initials(emp.name)}
+                    </span>
+                    {emp.name.split(" ")[0]}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Reassign */}
         <div>
@@ -2016,7 +2092,7 @@ function EmployeeProfileView({ tasks, employees, currentEmployeeId, employeeEmai
 }) {
   const me = employees.find(e => e.id === currentEmployeeId);
   const myTasks = tasks.filter(t => t.assigneeId === currentEmployeeId);
-  const done = myTasks.filter(t => t.status === "done").length;
+  const done = myTasks.filter(t => isFinished(t.status)).length;
 
   return (
     <div className="p-5">
@@ -2065,8 +2141,22 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
   const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null);
   const [toast, setToast]         = useState<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [autoAssign, setAutoAssign] = useState(false);
 
   const currentEmployeeId = membershipId ?? "";
+
+  useEffect(() => {
+    let cancelled = false;
+    supabase.from("organizations").select("auto_assign").eq("id", orgId).maybeSingle()
+      .then(({ data }) => { if (!cancelled && data) setAutoAssign(data.auto_assign); });
+    return () => { cancelled = true; };
+  }, [orgId]);
+
+  const handleAutoAssignChange = async (v: boolean) => {
+    setAutoAssign(v);
+    const { error } = await supabase.from("organizations").update({ auto_assign: v }).eq("id", orgId);
+    if (error) { showToast(error.message); setAutoAssign(!v); }
+  };
 
   const fetchEmployees = useCallback(async () => {
     setEmployeesLoading(true);
@@ -2153,11 +2243,58 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
   // Storage object PATH, never a URL — VoiceRecorder/ImagePicker upload to
   // Storage themselves and hand back the path; signed URLs are resolved
   // fresh at render time by VoiceNotePlayer/SignedTaskImage, never stored.
-  const handleStatus = async (id: string, status: TaskStatus) => {
-    const { error } = await supabase.from("tasks").update({ status }).eq("id", id);
+  const logEvent = async (taskId: string, eventType: TaskEventType, detail: Record<string, unknown> = {}) => {
+    await supabase.from("task_events").insert({
+      task_id: taskId,
+      event_type: eventType,
+      actor_id: currentEmployeeId || null,
+      detail,
+    });
+  };
+
+  // Guarded one-step lifecycle transitions. Each writes the new status
+  // then logs a task_events row — every transition is auditable, and
+  // there is no free-form status setter left anywhere in the app.
+  const handleAccept = async (id: string) => {
+    const { error } = await supabase.from("tasks").update({ status: "accepted" }).eq("id", id);
     if (error) { showToast(error.message); return; }
+    await logEvent(id, "status_change", { from: "assigned", to: "accepted" });
     await fetchTasks();
-    showToast(status === "done" ? "Marked complete!" : "Status updated");
+    showToast("Accepted");
+  };
+  const handleStart = async (id: string) => {
+    const { error } = await supabase.from("tasks").update({ status: "working" }).eq("id", id);
+    if (error) { showToast(error.message); return; }
+    await logEvent(id, "status_change", { from: "accepted", to: "working" });
+    await fetchTasks();
+    showToast("Task started");
+  };
+  const handleComplete = async (id: string) => {
+    const { error } = await supabase.from("tasks").update({ status: "completed" }).eq("id", id);
+    if (error) { showToast(error.message); return; }
+    await logEvent(id, "status_change", { from: "working", to: "completed" });
+    await fetchTasks();
+    showToast("Marked complete!");
+  };
+  const handleCloseTask = async (id: string) => {
+    const { error } = await supabase.from("tasks").update({ status: "closed" }).eq("id", id);
+    if (error) { showToast(error.message); return; }
+    await logEvent(id, "status_change", { from: "completed", to: "closed" });
+    await fetchTasks();
+    showToast("Task closed");
+  };
+  // Completed -> Assigned reopen/reassign. Not a "status_change" event —
+  // logged as its own "reassigned" type per the spec. Comments and
+  // attachments are untouched: this only updates status/assignee_id.
+  const handleReopenReassign = async (id: string, newAssigneeId: string | null) => {
+    const current = tasks.find(t => t.id === id);
+    const { error } = await supabase.from("tasks").update({ status: "assigned", assignee_id: newAssigneeId }).eq("id", id);
+    if (error) { showToast(error.message); return; }
+    await logEvent(id, "reassigned", { from_assignee: current?.assigneeId ?? null, to_assignee: newAssigneeId });
+    await fetchTasks();
+    const emp = employees.find(e => e.id === newAssigneeId);
+    if (emp && newAssigneeId !== current?.assigneeId) { showToast(`Reopened and reassigned to ${emp.name} 🔔`); return; }
+    showToast("Task reopened");
   };
   const handleDeleteTask = async (id: string) => {
     const { error } = await supabase.from("tasks").delete().eq("id", id);
@@ -2183,7 +2320,11 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
     await fetchTasks();
     showToast("Task saved");
   };
-  const handleAddTask = async (data: Omit<Task, "createdAt" | "comments" | "order">) => {
+  const handleAddTask = async (data: Omit<Task, "status" | "createdAt" | "comments" | "order">) => {
+    // Draft -> Assigned happens by creating with an assignee here (no
+    // separate "save as draft" flow yet — that's the next sprint item).
+    // Assigned -> Accepted is automatic when the org has auto-assign on.
+    const initialStatus: TaskStatus = autoAssign ? "accepted" : "assigned";
     const { error } = await supabase.from("tasks").insert({
       id: data.id,
       org_id: orgId,
@@ -2191,7 +2332,7 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
       description: data.description,
       assignee_id: data.assigneeId,
       created_by: currentEmployeeId || null,
-      status: data.status,
+      status: initialStatus,
       priority: data.priority,
       due_date: data.dueDate || null,
       voice_note_url: data.voiceNoteUrl,
@@ -2247,8 +2388,8 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
         { id: "tasks"     as View, label: "My Tasks", Icon: ListTodo  },
         { id: "settings"  as View, label: "Profile",  Icon: Settings  },
       ];
-  const myTasksCount = tasks.filter(t => t.assigneeId === currentEmployeeId && t.status !== "done").length;
-  const activeTasks = role === "owner" ? tasks.filter(t => t.status !== "done").length : myTasksCount;
+  const myTasksCount = tasks.filter(t => t.assigneeId === currentEmployeeId && !isFinished(t.status)).length;
+  const activeTasks = role === "owner" ? tasks.filter(t => !isFinished(t.status)).length : myTasksCount;
 
   return (
     <>
@@ -2279,7 +2420,7 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
             {role === "owner" && view === "tasks" && (
               <TasksView
                 tasks={tasks} employees={employees} loading={tasksLoading}
-                onStatus={handleStatus} onDelete={handleDeleteTask} onEdit={setEditTask}
+                onDelete={handleDeleteTask} onEdit={setEditTask}
               />
             )}
             {role === "owner" && view === "settings" && (
@@ -2287,6 +2428,8 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
                 tasks={tasks} employees={employees} employeesLoading={employeesLoading}
                 ownerName={fullName?.trim() || user?.email || ""}
                 orgId={orgId}
+                autoAssign={autoAssign}
+                onAutoAssignChange={handleAutoAssignChange}
                 onInvited={fetchEmployees}
                 onSignOut={signOut}
               />
@@ -2297,7 +2440,6 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
                 tasks={tasks} employees={employees}
                 currentEmployeeId={currentEmployeeId}
                 loading={tasksLoading}
-                onStatus={handleStatus}
                 onReorder={handleReorder}
                 onOpenTask={setEditTask}
               />
@@ -2377,9 +2519,11 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
             task={current}
             employees={employees}
             orgId={orgId}
-            canEdit={role === "owner" || (current.createdById === currentEmployeeId && current.status === "todo")}
+            canEdit={role === "owner" || (current.createdById === currentEmployeeId && isNotYetStarted(current.status))}
             onSave={handleSaveTask}
             onDelete={id => { handleDeleteTask(id); setEditTask(null); }}
+            onCloseTask={handleCloseTask}
+            onReopen={handleReopenReassign}
             onClose={() => setEditTask(null)}
           />
         );
@@ -2392,8 +2536,11 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
             employees={employees}
             orgId={orgId}
             currentEmployeeId={currentEmployeeId}
-            canEdit={current.createdById === currentEmployeeId && current.status === "todo"}
-            onStatus={handleStatus}
+            canEdit={current.createdById === currentEmployeeId && isNotYetStarted(current.status)}
+            onAccept={handleAccept}
+            onStart={handleStart}
+            onComplete={handleComplete}
+            onReopen={handleReopenReassign}
             onReassign={handleReassign}
             onAddComment={handleAddComment}
             onSave={handleSaveTask}

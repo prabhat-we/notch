@@ -3,8 +3,9 @@
  * ──────────────────────────────────────────────────────────── */
 
 export type MembershipRole = "owner" | "employee";
-export type TaskStatus = "todo" | "in-progress" | "done";
+export type TaskStatus = "draft" | "assigned" | "accepted" | "working" | "completed" | "closed";
 export type TaskPriority = "low" | "medium" | "high";
+export type TaskEventType = "status_change" | "reassigned";
 
 export interface Database {
   public: {
@@ -13,16 +14,19 @@ export interface Database {
         Row: {
           id: string;
           name: string;
+          auto_assign: boolean;
           created_at: string;
         };
         Insert: {
           id?: string;
           name: string;
+          auto_assign?: boolean;
           created_at?: string;
         };
         Update: {
           id?: string;
           name?: string;
+          auto_assign?: boolean;
           created_at?: string;
         };
         Relationships: [];
@@ -184,6 +188,46 @@ export interface Database {
           {
             foreignKeyName: "comments_author_id_fkey";
             columns: ["author_id"];
+            referencedRelation: "memberships";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
+      task_events: {
+        Row: {
+          id: string;
+          task_id: string;
+          event_type: TaskEventType;
+          actor_id: string | null;
+          detail: Record<string, unknown>;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          task_id: string;
+          event_type: TaskEventType;
+          actor_id?: string | null;
+          detail?: Record<string, unknown>;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          task_id?: string;
+          event_type?: TaskEventType;
+          actor_id?: string | null;
+          detail?: Record<string, unknown>;
+          created_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "task_events_task_id_fkey";
+            columns: ["task_id"];
+            referencedRelation: "tasks";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "task_events_actor_id_fkey";
+            columns: ["actor_id"];
             referencedRelation: "memberships";
             referencedColumns: ["id"];
           },

@@ -238,3 +238,68 @@ create policy "task media delete for org members" on storage.objects
         and m.user_id = (select auth.uid())
     )
   );
+
+-- ============================================
+-- TASK LIFECYCLE STATE MACHINE
+-- status: draft -> assigned -> accepted -> working -> completed -> closed
+-- (completed -> assigned is a reopen/reassign, logged as a "reassigned"
+-- task_event rather than being a status of its own.)
+-- ============================================
+
+-- Map the old 3-state values onto their closest lifecycle equivalent
+-- before the constraint changes. Safe to re-run — no rows match the old
+-- values a second time.
+update tasks set status = 'assigned'  where status = 'todo';
+update tasks set status = 'working'   where status = 'in-progress';
+update tasks set status = 'completed' where status = 'done';
+
+alter table tasks drop constraint if exists tasks_status_check;
+alter table tasks add constraint tasks_status_check
+  check (status in ('draft','assigned','accepted','working','completed','closed'));
+alter table tasks alter column status set default 'draft';
+
+-- Org-level setting: when on, Assigned -> Accepted happens automatically
+-- at assignment instead of requiring the assignee to tap "why notch".
+alter table organizations add column if not exists auto_assign boolean not null default false;
+
+-- organizations had no update policy at all before this — the Settings
+-- screen's Auto Assign toggle needs one to actually persist.
+drop policy if exists "owners can update their org" on organizations;
+create policy "owners can update their org" on organizations
+  for update using (
+    exists (select 1 from memberships m where m.org_id = organizations.id and m.user_id = (select auth.uid()) and m.role = 'owner')
+  );
+
+-- ============================================
+-- TASK_EVENTS  (status-change / reassignment history)
+-- ============================================
+create table if not exists task_events (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null references tasks(id) on delete cascade,
+  event_type text not null,                 -- 'status_change' | 'reassigned'
+  actor_id uuid references memberships(id) on delete set null,
+  detail jsonb not null default '{}',       -- e.g. {"from":"accepted","to":"working"}
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_task_events_task on task_events(task_id);
+
+alter table task_events enable row level security;
+
+-- Visible/insertable by anyone in the task's org — same pattern as comments.
+drop policy if exists "task events select for org members" on task_events;
+create policy "task events select for org members" on task_events
+  for select using (
+    exists (
+      select 1 from tasks t join memberships m on m.org_id = t.org_id
+      where t.id = task_events.task_id and m.user_id = (select auth.uid())
+    )
+  );
+
+drop policy if exists "task events insert for org members" on task_events;
+create policy "task events insert for org members" on task_events
+  for insert with check (
+    exists (
+      select 1 from tasks t join memberships m on m.org_id = t.org_id
+      where t.id = task_events.task_id and m.user_id = (select auth.uid())
+    )
+  );
