@@ -12,6 +12,7 @@ import CompleteProfileScreen from "./auth/CompleteProfileScreen";
 import { supabase } from "../lib/supabase";
 import { getToday } from "../lib/date";
 import { format, addDays } from "date-fns";
+import { uploadTaskMedia, resolveSignedUrl } from "../lib/storage";
 
 
 /* ─── Types ───────────────────────────────────────────────── */
@@ -186,15 +187,38 @@ function BottomSheet({ onClose, children }: { onClose: () => void; children: Rea
 }
 
 /* ─── VoiceRecorder ───────────────────────────────────────── */
-function VoiceRecorder({ onRecorded, existingUrl }: { onRecorded: (url: string | null) => void; existingUrl?: string | null }) {
+function VoiceRecorder({ orgId, taskId, onRecorded, existingUrl, onUploadingChange }: {
+  orgId: string;
+  taskId: string;
+  onRecorded: (path: string | null) => void;
+  existingUrl?: string | null;
+  onUploadingChange?: (uploading: boolean) => void;
+}) {
   const [recording, setRecording] = useState(false);
   const [secs, setSecs] = useState(0);
-  const [url, setUrl] = useState<string | null>(existingUrl ?? null);
+  const [path, setPath] = useState<string | null>(existingUrl ?? null);
   const [playing, setPlaying] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [signedUrl, setSignedUrl] = useState<string | null | undefined>(undefined);
   const mr = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioEl = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => { onUploadingChange?.(uploading); }, [uploading, onUploadingChange]);
+
+  // Re-resolve a fresh signed URL for playback whenever the underlying
+  // path changes — a signed URL is never stored, only generated on demand.
+  useEffect(() => {
+    audioEl.current = null;
+    setPlaying(false);
+    if (!path) { setSignedUrl(null); return; }
+    let cancelled = false;
+    setSignedUrl(undefined);
+    resolveSignedUrl(path).then(url => { if (!cancelled) setSignedUrl(url); });
+    return () => { cancelled = true; };
+  }, [path]);
 
   const start = async () => {
     try {
@@ -203,12 +227,20 @@ function VoiceRecorder({ onRecorded, existingUrl }: { onRecorded: (url: string |
       mr.current = rec;
       chunks.current = [];
       rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.current.push(e.data); };
-      rec.onstop = () => {
+      rec.onstop = async () => {
         const blob = new Blob(chunks.current, { type: "audio/webm" });
-        const blobUrl = URL.createObjectURL(blob);
-        setUrl(blobUrl);
-        onRecorded(blobUrl);
         stream.getTracks().forEach(t => t.stop());
+        setUploading(true);
+        setUploadError(null);
+        try {
+          const uploadedPath = await uploadTaskMedia(orgId, taskId, blob, "webm");
+          setPath(uploadedPath);
+          onRecorded(uploadedPath);
+        } catch {
+          setUploadError("Couldn't upload voice note — try recording again.");
+        } finally {
+          setUploading(false);
+        }
       };
       rec.start();
       setRecording(true);
@@ -224,9 +256,9 @@ function VoiceRecorder({ onRecorded, existingUrl }: { onRecorded: (url: string |
   };
 
   const togglePlay = () => {
-    if (!url) return;
+    if (!signedUrl) return;
     if (!audioEl.current) {
-      audioEl.current = new Audio(url);
+      audioEl.current = new Audio(signedUrl);
       audioEl.current.onended = () => setPlaying(false);
     }
     if (playing) { audioEl.current.pause(); setPlaying(false); }
@@ -235,19 +267,32 @@ function VoiceRecorder({ onRecorded, existingUrl }: { onRecorded: (url: string |
 
   const clear = () => {
     audioEl.current?.pause();
-    setUrl(null); setSecs(0); setPlaying(false);
+    setPath(null); setSecs(0); setPlaying(false); setUploadError(null);
     onRecorded(null);
   };
 
-  if (url) {
+  if (uploading) {
     return (
       <div className="flex items-center gap-3 bg-indigo-50 border border-indigo-100 rounded-2xl px-4 py-3">
-        <button type="button" onClick={togglePlay} className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center flex-shrink-0 shadow-sm">
+        <Loader2 size={16} className="text-indigo-400 animate-spin flex-shrink-0" />
+        <p className="text-xs font-semibold text-indigo-600">Uploading voice note…</p>
+      </div>
+    );
+  }
+
+  if (path) {
+    return (
+      <div className="flex items-center gap-3 bg-indigo-50 border border-indigo-100 rounded-2xl px-4 py-3">
+        <button type="button" onClick={togglePlay} disabled={!signedUrl}
+          className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center flex-shrink-0 shadow-sm disabled:opacity-40"
+        >
           {playing ? <Pause size={13} className="text-white" /> : <Play size={13} className="text-white ml-0.5" />}
         </button>
         <div className="flex-1">
           <p className="text-xs font-semibold text-indigo-700">Voice note</p>
-          <p className="text-[11px] text-indigo-400 font-mono">{fmtTime(secs)} · tap to play</p>
+          <p className="text-[11px] text-indigo-400 font-mono">
+            {signedUrl === undefined ? "Loading…" : signedUrl === null ? "Couldn't load audio" : "tap to play"}
+          </p>
         </div>
         <button type="button" onClick={clear} className="text-slate-300 hover:text-red-400 transition-colors">
           <X size={15} />
@@ -257,91 +302,193 @@ function VoiceRecorder({ onRecorded, existingUrl }: { onRecorded: (url: string |
   }
 
   return (
-    <div className="flex items-center gap-3">
-      <button type="button" onClick={recording ? stop : start}
-        className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-          recording ? "bg-red-500 text-white" : "bg-indigo-50 text-indigo-600 hover:bg-indigo-100"
-        }`}
-      >
-        {recording ? <StopCircle size={15} /> : <Mic size={15} />}
-        {recording ? `Recording ${fmtTime(secs)}` : "Record voice note"}
-      </button>
-      {recording && (
-        <div className="flex items-end gap-0.5">
-          {[4, 8, 12, 8, 6, 10, 4].map((h, i) => (
-            <div key={i} className="w-1 bg-red-400 rounded-full animate-bounce" style={{ height: h, animationDelay: `${i * 80}ms` }} />
-          ))}
-        </div>
-      )}
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-3">
+        <button type="button" onClick={recording ? stop : start}
+          className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+            recording ? "bg-red-500 text-white" : "bg-indigo-50 text-indigo-600 hover:bg-indigo-100"
+          }`}
+        >
+          {recording ? <StopCircle size={15} /> : <Mic size={15} />}
+          {recording ? `Recording ${fmtTime(secs)}` : "Record voice note"}
+        </button>
+        {recording && (
+          <div className="flex items-end gap-0.5">
+            {[4, 8, 12, 8, 6, 10, 4].map((h, i) => (
+              <div key={i} className="w-1 bg-red-400 rounded-full animate-bounce" style={{ height: h, animationDelay: `${i * 80}ms` }} />
+            ))}
+          </div>
+        )}
+      </div>
+      {uploadError && <p className="text-[11px] font-semibold text-red-500">{uploadError}</p>}
     </div>
   );
 }
 
-/* ─── ImagePicker ─────────────────────────────────────────── */
-function ImagePicker({ images, onChange, size = "md" }: { images: string[]; onChange: (urls: string[]) => void; size?: "md" | "sm" }) {
+/* ─── ImagePicker ─────────────────────────────────────────── *
+ * `upload` is opt-in: when provided (task attachments), picked files
+ * are uploaded to Storage and `onChange` receives the resulting object
+ * paths, resolved to signed URLs for display via SignedTaskImage. When
+ * omitted (comment composer), behavior is unchanged — local blob: URLs
+ * only, never persisted — comment attachments are a separate, tracked
+ * gap outside this pass. */
+function ImagePicker({ images, onChange, size = "md", upload, onUploadingChange }: {
+  images: string[];
+  onChange: (urls: string[]) => void;
+  size?: "md" | "sm";
+  upload?: { orgId: string; taskId: string };
+  onUploadingChange?: (uploading: boolean) => void;
+}) {
   const fileInput = useRef<HTMLInputElement | null>(null);
   const dim = size === "sm" ? "w-12 h-12" : "w-16 h-16";
+  const [pendingCount, setPendingCount] = useState(0);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
-  const handleFiles = (files: FileList | null) => {
+  useEffect(() => { onUploadingChange?.(pendingCount > 0); }, [pendingCount, onUploadingChange]);
+
+  const handleFiles = async (files: FileList | null) => {
     if (!files || !files.length) return;
-    const urls = Array.from(files).map(f => URL.createObjectURL(f));
-    onChange([...images, ...urls]);
+    if (!upload) {
+      const urls = Array.from(files).map(f => URL.createObjectURL(f));
+      onChange([...images, ...urls]);
+      return;
+    }
+    setUploadError(null);
+    const fileList = Array.from(files);
+    setPendingCount(c => c + fileList.length);
+    try {
+      const paths = await Promise.all(fileList.map(f => uploadTaskMedia(upload.orgId, upload.taskId, f, extFromFile(f))));
+      onChange([...images, ...paths]);
+    } catch {
+      setUploadError("Couldn't upload one or more images — try again.");
+    } finally {
+      setPendingCount(c => c - fileList.length);
+    }
   };
 
   const remove = (url: string) => onChange(images.filter(u => u !== url));
 
   return (
-    <div className="flex flex-wrap gap-2">
-      {images.map(url => (
-        <div key={url} className={`relative ${dim} rounded-xl overflow-hidden flex-shrink-0 bg-slate-100`}>
-          <img src={url} alt="Attached" className="w-full h-full object-cover" />
-          <button type="button" onClick={() => remove(url)}
-            className="absolute top-0.5 right-0.5 w-5 h-5 bg-black/60 rounded-full flex items-center justify-center"
-          >
-            <X size={11} className="text-white" />
-          </button>
-        </div>
-      ))}
-      <button type="button" onClick={() => fileInput.current?.click()}
-        className={`${dim} rounded-xl border-2 border-dashed border-slate-200 flex flex-col items-center justify-center gap-1 text-slate-400 hover:border-indigo-300 hover:text-indigo-500 hover:bg-indigo-50/50 transition-colors flex-shrink-0`}
-      >
-        <ImageIcon size={size === "sm" ? 14 : 16} />
-        <span className="text-[9px] font-bold">Add image</span>
-      </button>
-      <input
-        ref={fileInput}
-        type="file"
-        accept="image/*"
-        multiple
-        className="hidden"
-        onChange={e => { handleFiles(e.target.files); e.target.value = ""; }}
-      />
+    <div>
+      <div className="flex flex-wrap gap-2">
+        {images.map(url => (
+          <div key={url} className={`relative ${dim} rounded-xl overflow-hidden flex-shrink-0 bg-slate-100`}>
+            {upload ? (
+              <SignedTaskImage path={url} className="w-full h-full" />
+            ) : (
+              <img src={url} alt="Attached" className="w-full h-full object-cover" />
+            )}
+            <button type="button" onClick={() => remove(url)}
+              className="absolute top-0.5 right-0.5 w-5 h-5 bg-black/60 rounded-full flex items-center justify-center"
+            >
+              <X size={11} className="text-white" />
+            </button>
+          </div>
+        ))}
+        {Array.from({ length: pendingCount }).map((_, i) => (
+          <div key={`pending-${i}`} className={`${dim} rounded-xl flex-shrink-0 bg-slate-100 flex items-center justify-center`}>
+            <Loader2 size={14} className="text-slate-400 animate-spin" />
+          </div>
+        ))}
+        <button type="button" onClick={() => fileInput.current?.click()}
+          className={`${dim} rounded-xl border-2 border-dashed border-slate-200 flex flex-col items-center justify-center gap-1 text-slate-400 hover:border-indigo-300 hover:text-indigo-500 hover:bg-indigo-50/50 transition-colors flex-shrink-0`}
+        >
+          <ImageIcon size={size === "sm" ? 14 : 16} />
+          <span className="text-[9px] font-bold">Add image</span>
+        </button>
+        <input
+          ref={fileInput}
+          type="file"
+          accept="image/*"
+          multiple
+          className="hidden"
+          onChange={e => { handleFiles(e.target.files); e.target.value = ""; }}
+        />
+      </div>
+      {uploadError && <p className="text-[11px] font-semibold text-red-500 mt-2">{uploadError}</p>}
     </div>
   );
 }
 
-/* ─── VoiceNotePlayer (read-only playback) ────────────────── */
-function VoiceNotePlayer({ url }: { url: string }) {
+function extFromFile(file: File): string {
+  const dot = file.name.lastIndexOf(".");
+  if (dot > 0 && dot < file.name.length - 1) return file.name.slice(dot + 1).toLowerCase();
+  return (file.type.split("/")[1] || "bin").toLowerCase();
+}
+
+/* ─── SignedTaskImage ─────────────────────────────────────── *
+ * Resolves a task-media storage path to a fresh signed URL on mount /
+ * whenever `path` changes, and renders a loading/error placeholder in
+ * the meantime — the signed URL itself is never cached or stored. */
+function SignedTaskImage({ path, className, alt = "Task attachment", fit = "cover" }: {
+  path: string;
+  className: string;
+  alt?: string;
+  fit?: "cover" | "contain";
+}) {
+  const [signedUrl, setSignedUrl] = useState<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSignedUrl(undefined);
+    resolveSignedUrl(path).then(url => { if (!cancelled) setSignedUrl(url); });
+    return () => { cancelled = true; };
+  }, [path]);
+
+  if (signedUrl === undefined) return <div className="w-16 h-16 rounded-xl bg-slate-100 animate-pulse flex-shrink-0" />;
+  if (signedUrl === null) return (
+    <div className="w-16 h-16 rounded-xl bg-red-50 flex items-center justify-center flex-shrink-0">
+      <ImageIcon size={14} className="text-red-300" />
+    </div>
+  );
+  const fitClass = fit === "contain" ? "object-contain" : "object-cover";
+  return <img src={signedUrl} alt={alt} className={`${className} ${fitClass}`} />;
+}
+
+/* ─── VoiceNotePlayer (read-only playback) ────────────────── *
+ * `path` is a storage object path, not a URL — a fresh signed URL is
+ * resolved on mount / whenever the path changes, never stored. */
+function VoiceNotePlayer({ path }: { path: string }) {
   const [playing, setPlaying] = useState(false);
+  const [signedUrl, setSignedUrl] = useState<string | null | undefined>(undefined);
   const audioEl = useRef<HTMLAudioElement | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    setSignedUrl(undefined);
+    resolveSignedUrl(path).then(url => { if (!cancelled) setSignedUrl(url); });
+    return () => { cancelled = true; };
+  }, [path]);
+
   const toggle = () => {
+    if (!signedUrl) return;
     if (!audioEl.current) {
-      audioEl.current = new Audio(url);
+      audioEl.current = new Audio(signedUrl);
       audioEl.current.onended = () => setPlaying(false);
     }
     if (playing) { audioEl.current.pause(); setPlaying(false); }
     else { audioEl.current.play(); setPlaying(true); }
   };
 
+  if (signedUrl === null) {
+    return (
+      <div className="flex items-center gap-3 bg-red-50 border border-red-100 rounded-2xl px-4 py-3">
+        <Volume2 size={15} className="text-red-300 flex-shrink-0" />
+        <p className="text-xs font-semibold text-red-500">Couldn't load voice note</p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex items-center gap-3 bg-indigo-50 border border-indigo-100 rounded-2xl px-4 py-3">
-      <button type="button" onClick={toggle} className="w-9 h-9 bg-indigo-600 rounded-full flex items-center justify-center flex-shrink-0 shadow-sm">
+      <button type="button" onClick={toggle} disabled={!signedUrl}
+        className="w-9 h-9 bg-indigo-600 rounded-full flex items-center justify-center flex-shrink-0 shadow-sm disabled:opacity-40"
+      >
         {playing ? <Pause size={14} className="text-white" /> : <Play size={14} className="text-white ml-0.5" />}
       </button>
       <div className="flex-1">
         <p className="text-xs font-semibold text-indigo-700">Voice instructions</p>
-        <p className="text-[11px] text-indigo-400 font-medium">{playing ? "Playing…" : "Tap to listen"}</p>
+        <p className="text-[11px] text-indigo-400 font-medium">{signedUrl === undefined ? "Loading…" : playing ? "Playing…" : "Tap to listen"}</p>
       </div>
       <Volume2 size={15} className="text-indigo-300 flex-shrink-0" />
     </div>
@@ -353,6 +500,7 @@ function TaskFormFields({
   title, setTitle, desc, setDesc, priority, setPriority,
   dueDate, setDueDate, assigneeId, setAssigneeId, status, setStatus,
   voiceNoteUrl, setVoice, imageUrls, setImageUrls, employees, showStatus,
+  orgId, taskId, onUploadingChange,
 }: {
   title: string; setTitle: (v: string) => void;
   desc: string; setDesc: (v: string) => void;
@@ -363,8 +511,13 @@ function TaskFormFields({
   voiceNoteUrl: string | null; setVoice: (v: string | null) => void;
   imageUrls: string[]; setImageUrls: (v: string[]) => void;
   employees: Employee[]; showStatus: boolean;
+  orgId: string; taskId: string;
+  onUploadingChange?: (uploading: boolean) => void;
 }) {
   const titleOptional = !showStatus && !title.trim() && (!!voiceNoteUrl || imageUrls.length > 0);
+  const [voiceUploading, setVoiceUploading] = useState(false);
+  const [imagesUploading, setImagesUploading] = useState(false);
+  useEffect(() => { onUploadingChange?.(voiceUploading || imagesUploading); }, [voiceUploading, imagesUploading, onUploadingChange]);
 
   return (
     <div className="space-y-5">
@@ -449,25 +602,30 @@ function TaskFormFields({
 
       <div>
         <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Voice Instructions</label>
-        <VoiceRecorder onRecorded={setVoice} existingUrl={voiceNoteUrl} />
+        <VoiceRecorder orgId={orgId} taskId={taskId} onRecorded={setVoice} existingUrl={voiceNoteUrl} onUploadingChange={setVoiceUploading} />
       </div>
 
       <div>
         <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Images</label>
-        <ImagePicker images={imageUrls} onChange={setImageUrls} />
+        <ImagePicker images={imageUrls} onChange={setImageUrls} upload={{ orgId, taskId }} onUploadingChange={setImagesUploading} />
       </div>
     </div>
   );
 }
 
 /* ─── AddTaskModal ────────────────────────────────────────── */
-function AddTaskModal({ employees, defaultAssigneeId, assignLabel, onAdd, onClose }: {
+function AddTaskModal({ employees, orgId, defaultAssigneeId, assignLabel, onAdd, onClose }: {
   employees: Employee[];
+  orgId: string;
   defaultAssigneeId?: string | null;
   assignLabel?: string;
-  onAdd: (t: Omit<Task, "id" | "createdAt" | "comments" | "order">) => void;
+  onAdd: (t: Omit<Task, "createdAt" | "comments" | "order">) => void;
   onClose: () => void;
 }) {
+  // Generated up front so voice/image uploads have a stable path
+  // ({org_id}/{task_id}/...) to land in before the task row exists —
+  // this same id is then used as the row's primary key on insert.
+  const [taskId]                    = useState(() => crypto.randomUUID());
   const [title, setTitle]           = useState("");
   const [desc, setDesc]             = useState("");
   const [assigneeId, setAssigneeId] = useState<string | null>(defaultAssigneeId ?? null);
@@ -476,13 +634,14 @@ function AddTaskModal({ employees, defaultAssigneeId, assignLabel, onAdd, onClos
   const [status, setStatus]         = useState<TaskStatus>("todo");
   const [voiceNoteUrl, setVoice]    = useState<string | null>(null);
   const [imageUrls, setImageUrls]   = useState<string[]>([]);
+  const [mediaUploading, setMediaUploading] = useState(false);
 
   const hasContent = !!title.trim() || !!voiceNoteUrl || imageUrls.length > 0;
 
   const submit = () => {
-    if (!hasContent) return;
+    if (!hasContent || mediaUploading) return;
     const finalTitle = title.trim() || (voiceNoteUrl ? "Voice note task" : "Image task");
-    onAdd({ title: finalTitle, description: desc, assigneeId, createdById: defaultAssigneeId ?? null, status, priority, dueDate, voiceNoteUrl, imageUrls });
+    onAdd({ id: taskId, title: finalTitle, description: desc, assigneeId, createdById: defaultAssigneeId ?? null, status, priority, dueDate, voiceNoteUrl, imageUrls });
     onClose();
   };
 
@@ -510,11 +669,12 @@ function AddTaskModal({ employees, defaultAssigneeId, assignLabel, onAdd, onClos
           voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
           imageUrls={imageUrls} setImageUrls={setImageUrls}
           employees={employees} showStatus={false}
+          orgId={orgId} taskId={taskId} onUploadingChange={setMediaUploading}
         />
-        <button type="button" onClick={submit} disabled={!hasContent}
+        <button type="button" onClick={submit} disabled={!hasContent || mediaUploading}
           className="w-full mt-5 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 disabled:cursor-not-allowed hover:bg-indigo-700 active:bg-indigo-800 transition-colors shadow-lg shadow-indigo-600/20"
         >
-          {assigneeName ? `Create & Notify ${assigneeName}` : "Create Task"}
+          {mediaUploading ? "Uploading…" : assigneeName ? `Create & Notify ${assigneeName}` : "Create Task"}
         </button>
       </div>
     </BottomSheet>
@@ -522,9 +682,10 @@ function AddTaskModal({ employees, defaultAssigneeId, assignLabel, onAdd, onClos
 }
 
 /* ─── EditTaskModal ───────────────────────────────────────── */
-function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: {
+function EditTaskModal({ task, employees, orgId, canEdit, onSave, onDelete, onClose }: {
   task: Task;
   employees: Employee[];
+  orgId: string;
   canEdit: boolean;
   onSave: (updated: Task) => void;
   onDelete: (id: string) => void;
@@ -541,6 +702,7 @@ function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: 
   const [imageUrls, setImageUrls]   = useState<string[]>(task.imageUrls);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [mediaUploading, setMediaUploading] = useState(false);
 
   const assignee = employees.find(e => e.id === task.assigneeId);
   const done = task.status === "done";
@@ -560,7 +722,7 @@ function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: 
   const cancel = () => setMode("view");
 
   const save = () => {
-    if (!title.trim()) return;
+    if (!title.trim() || mediaUploading) return;
     onSave({ ...task, title, description: desc, assigneeId, priority, dueDate, status, voiceNoteUrl, imageUrls });
     setMode("view");
   };
@@ -640,7 +802,7 @@ function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: 
             </div>
           </div>
 
-          {task.voiceNoteUrl && <VoiceNotePlayer url={task.voiceNoteUrl} />}
+          {task.voiceNoteUrl && <VoiceNotePlayer path={task.voiceNoteUrl} />}
 
           {task.imageUrls.length > 0 && (
             <div>
@@ -648,11 +810,11 @@ function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: 
                 Images {task.imageUrls.length > 1 && `(${task.imageUrls.length})`}
               </label>
               <div className="flex flex-wrap gap-2">
-                {task.imageUrls.map(url => (
-                  <button key={url} type="button" onClick={() => setLightboxUrl(url)}
+                {task.imageUrls.map(path => (
+                  <button key={path} type="button" onClick={() => setLightboxUrl(path)}
                     className="w-16 h-16 rounded-xl overflow-hidden flex-shrink-0"
                   >
-                    <img src={url} alt="Task attachment" className="w-full h-full object-cover" />
+                    <SignedTaskImage path={path} className="w-full h-full" />
                   </button>
                 ))}
               </div>
@@ -679,6 +841,7 @@ function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: 
             voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
             imageUrls={imageUrls} setImageUrls={setImageUrls}
             employees={employees} showStatus={true}
+            orgId={orgId} taskId={task.id} onUploadingChange={setMediaUploading}
           />
           <div className="flex gap-3 mt-5">
             <button type="button" onClick={cancel}
@@ -686,10 +849,10 @@ function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: 
             >
               Cancel
             </button>
-            <button type="button" onClick={save} disabled={!title.trim()}
+            <button type="button" onClick={save} disabled={!title.trim() || mediaUploading}
               className="flex-1 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"
             >
-              Save Changes
+              {mediaUploading ? "Uploading…" : "Save Changes"}
             </button>
           </div>
         </div>
@@ -701,7 +864,7 @@ function EditTaskModal({ task, employees, canEdit, onSave, onDelete, onClose }: 
         className="fixed inset-0 z-[70] bg-black/85 flex items-center justify-center p-6"
         onClick={() => setLightboxUrl(null)}
       >
-        <img src={lightboxUrl} alt="Task attachment" className="max-w-full max-h-full rounded-2xl object-contain" />
+        <SignedTaskImage path={lightboxUrl} className="max-w-full max-h-full rounded-2xl" fit="contain" />
         <button
           type="button"
           onClick={() => setLightboxUrl(null)}
@@ -1108,14 +1271,16 @@ function TasksView({ tasks, employees, loading, onStatus, onDelete, onEdit }: {
     { id: "done", label: "Done" },
   ];
 
-  const handleVoicePlay = (url: string) => {
-    if (playingUrl === url) { audioEl.current?.pause(); setPlayingUrl(null); return; }
+  const handleVoicePlay = async (path: string) => {
+    if (playingUrl === path) { audioEl.current?.pause(); setPlayingUrl(null); return; }
     audioEl.current?.pause();
+    const url = await resolveSignedUrl(path);
+    if (!url) return;
     const a = new Audio(url);
     a.onended = () => setPlayingUrl(null);
     a.play();
     audioEl.current = a;
-    setPlayingUrl(url);
+    setPlayingUrl(path);
   };
 
   return (
@@ -1567,9 +1732,10 @@ function EmployeeTasksView({ tasks, employees, currentEmployeeId, loading, onSta
 }
 
 /* ─── EmployeeTaskModal (detail + comments + reassign) ────── */
-function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStatus, onReassign, onAddComment, onSave, onClose }: {
+function EmployeeTaskModal({ task, employees, orgId, currentEmployeeId, canEdit, onStatus, onReassign, onAddComment, onSave, onClose }: {
   task: Task;
   employees: Employee[];
+  orgId: string;
   currentEmployeeId: string;
   canEdit: boolean;
   onStatus: (id: string, s: TaskStatus) => void;
@@ -1591,6 +1757,7 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStat
   const [dueDate, setDueDate]       = useState(task.dueDate);
   const [voiceNoteUrl, setVoice]    = useState<string | null>(task.voiceNoteUrl);
   const [imageUrls, setImageUrls]   = useState<string[]>(task.imageUrls);
+  const [mediaUploading, setMediaUploading] = useState(false);
   const assignee = employees.find(e => e.id === task.assigneeId);
   const done = task.status === "done";
   const peers = employees.filter(e => e.id !== task.assigneeId);
@@ -1616,7 +1783,7 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStat
   const cancelEdit = () => setMode("view");
 
   const saveEdit = () => {
-    if (!title.trim()) return;
+    if (!title.trim() || mediaUploading) return;
     onSave({ ...task, title, description: desc, assigneeId, priority, dueDate, voiceNoteUrl, imageUrls });
     setMode("view");
   };
@@ -1643,6 +1810,7 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStat
             voiceNoteUrl={voiceNoteUrl} setVoice={setVoice}
             imageUrls={imageUrls} setImageUrls={setImageUrls}
             employees={employees} showStatus={false}
+            orgId={orgId} taskId={task.id} onUploadingChange={setMediaUploading}
           />
           <div className="flex gap-3 mt-5">
             <button type="button" onClick={cancelEdit}
@@ -1650,10 +1818,10 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStat
             >
               Cancel
             </button>
-            <button type="button" onClick={saveEdit} disabled={!title.trim()}
+            <button type="button" onClick={saveEdit} disabled={!title.trim() || mediaUploading}
               className="flex-1 bg-indigo-600 text-white py-4 rounded-2xl text-sm font-bold disabled:opacity-30 hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"
             >
-              Save Changes
+              {mediaUploading ? "Uploading…" : "Save Changes"}
             </button>
           </div>
         </div>
@@ -1680,7 +1848,7 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStat
         )}
 
         {/* Voice note */}
-        {task.voiceNoteUrl && <VoiceNotePlayer url={task.voiceNoteUrl} />}
+        {task.voiceNoteUrl && <VoiceNotePlayer path={task.voiceNoteUrl} />}
 
         {/* Images */}
         {task.imageUrls.length > 0 && (
@@ -1689,11 +1857,11 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStat
               Images {task.imageUrls.length > 1 && `(${task.imageUrls.length})`}
             </label>
             <div className="flex flex-wrap gap-2">
-              {task.imageUrls.map(url => (
-                <button key={url} type="button" onClick={() => setLightboxUrl(url)}
+              {task.imageUrls.map(path => (
+                <button key={path} type="button" onClick={() => setLightboxUrl(path)}
                   className="w-16 h-16 rounded-xl overflow-hidden flex-shrink-0"
                 >
-                  <img src={url} alt="Task attachment" className="w-full h-full object-cover" />
+                  <SignedTaskImage path={path} className="w-full h-full" />
                 </button>
               ))}
             </div>
@@ -1824,7 +1992,7 @@ function EmployeeTaskModal({ task, employees, currentEmployeeId, canEdit, onStat
         className="fixed inset-0 z-[70] bg-black/85 flex items-center justify-center p-6"
         onClick={() => setLightboxUrl(null)}
       >
-        <img src={lightboxUrl} alt="Task attachment" className="max-w-full max-h-full rounded-2xl object-contain" />
+        <SignedTaskImage path={lightboxUrl} className="max-w-full max-h-full rounded-2xl" fit="contain" />
         <button
           type="button"
           onClick={() => setLightboxUrl(null)}
@@ -1981,11 +2149,10 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
   // Every mutation below hits Supabase first, then re-pulls the full task
   // list (fetchTasks) so the acting user's own screen reflects the change
   // immediately — same refetch path the focus/visibility listener uses for
-  // cross-profile sync. Voice notes and image attachments are intentionally
-  // left out of every insert/update payload: the picker/recorder above only
-  // ever produce local blob: URLs (no upload step yet), so sending them
-  // would overwrite voice_note_url/image_urls with values nobody else could
-  // load — that wiring is a separate milestone.
+  // cross-profile sync. voice_note_url/image_urls store the task-media
+  // Storage object PATH, never a URL — VoiceRecorder/ImagePicker upload to
+  // Storage themselves and hand back the path; signed URLs are resolved
+  // fresh at render time by VoiceNotePlayer/SignedTaskImage, never stored.
   const handleStatus = async (id: string, status: TaskStatus) => {
     const { error } = await supabase.from("tasks").update({ status }).eq("id", id);
     if (error) { showToast(error.message); return; }
@@ -2008,14 +2175,17 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
         status: updated.status,
         priority: updated.priority,
         due_date: updated.dueDate || null,
+        voice_note_url: updated.voiceNoteUrl,
+        image_urls: updated.imageUrls,
       })
       .eq("id", updated.id);
     if (error) { showToast(error.message); return; }
     await fetchTasks();
     showToast("Task saved");
   };
-  const handleAddTask = async (data: Omit<Task, "id" | "createdAt" | "comments" | "order">) => {
+  const handleAddTask = async (data: Omit<Task, "createdAt" | "comments" | "order">) => {
     const { error } = await supabase.from("tasks").insert({
+      id: data.id,
       org_id: orgId,
       title: data.title,
       description: data.description,
@@ -2024,6 +2194,8 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
       status: data.status,
       priority: data.priority,
       due_date: data.dueDate || null,
+      voice_note_url: data.voiceNoteUrl,
+      image_urls: data.imageUrls,
     });
     if (error) { showToast(error.message); return; }
     await fetchTasks();
@@ -2191,6 +2363,7 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
       {showAdd && (
         <AddTaskModal
           employees={employees}
+          orgId={orgId}
           defaultAssigneeId={role === "employee" ? currentEmployeeId : null}
           assignLabel={role === "employee" ? "Assign to yourself or a teammate" : undefined}
           onAdd={handleAddTask}
@@ -2203,6 +2376,7 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
           <EditTaskModal
             task={current}
             employees={employees}
+            orgId={orgId}
             canEdit={role === "owner" || (current.createdById === currentEmployeeId && current.status === "todo")}
             onSave={handleSaveTask}
             onDelete={id => { handleDeleteTask(id); setEditTask(null); }}
@@ -2216,6 +2390,7 @@ function AuthenticatedApp({ role, orgId }: { role: AppRole; orgId: string }) {
           <EmployeeTaskModal
             task={current}
             employees={employees}
+            orgId={orgId}
             currentEmployeeId={currentEmployeeId}
             canEdit={current.createdById === currentEmployeeId && current.status === "todo"}
             onStatus={handleStatus}

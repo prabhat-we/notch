@@ -186,3 +186,55 @@ create policy "comments insert for org members" on comments
       where t.id = comments.task_id and m.user_id = (select auth.uid())
     )
   );
+
+-- ============================================
+-- TASK MEDIA STORAGE (voice notes + image attachments)
+-- Private bucket — object path convention is {org_id}/{task_id}/{filename},
+-- so RLS can check org membership directly from the path (no signed URL
+-- is ever stored; the app calls storage.createSignedUrl() at render time).
+-- ============================================
+insert into storage.buckets (id, name, public)
+values ('task-media', 'task-media', false)
+on conflict (id) do nothing;
+
+-- Org members can view media belonging to tasks in their own org — this
+-- is what lets the app request a signed URL for a given path at all.
+drop policy if exists "task media select for org members" on storage.objects;
+create policy "task media select for org members" on storage.objects
+  for select using (
+    bucket_id = 'task-media'
+    and exists (
+      select 1 from memberships m
+      where m.org_id::text = (storage.foldername(name))[1]
+        and m.user_id = (select auth.uid())
+    )
+  );
+
+-- Org members can upload media under their own org's path prefix.
+drop policy if exists "task media insert for org members" on storage.objects;
+create policy "task media insert for org members" on storage.objects
+  for insert with check (
+    bucket_id = 'task-media'
+    and exists (
+      select 1 from memberships m
+      where m.org_id::text = (storage.foldername(name))[1]
+        and m.user_id = (select auth.uid())
+    )
+  );
+
+-- Org members can remove media belonging to their own org — mirrors the
+-- existing "tasks delete for org members" policy (any org member can
+-- delete a task, so they can remove its attachments too). Not currently
+-- called from the app (attachment removal today just drops the
+-- reference client-side before save), but the policy is here so that
+-- capability can be wired up later without another SQL change.
+drop policy if exists "task media delete for org members" on storage.objects;
+create policy "task media delete for org members" on storage.objects
+  for delete using (
+    bucket_id = 'task-media'
+    and exists (
+      select 1 from memberships m
+      where m.org_id::text = (storage.foldername(name))[1]
+        and m.user_id = (select auth.uid())
+    )
+  );
